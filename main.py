@@ -27,7 +27,7 @@ CHANNEL_NAME = "Фрики Крым"
 
 # Подпись к постам
 SUGGEST_BOT = "@Freakcrimeabot"
-DELETE_CONTACT = "@Triumfal"
+DELETE_CONTACT = "@Triumfal @krymnft"
 
 logging.basicConfig(level=logging.INFO)
 
