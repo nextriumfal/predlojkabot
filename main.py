@@ -27,7 +27,7 @@ CHANNEL_NAME = "Фрики Крым"
 
 # Подпись к постам
 SUGGEST_BOT = "@Freakcrimeabot"
-DELETE_CONTACT = "@Triumfal @krymnft"
+DELETE_CONTACT = "@Triumfal"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -409,9 +409,9 @@ async def approve_post(callback: types.CallbackQuery):
         return
 
     footer = (
-        f"📢 <a href='{CHANNEL_URL}'>{CHANNEL_NAME}</a>\n\n"
         f"предложить пост : {SUGGEST_BOT}\n\n"
-        f"удалить / узнать пост {DELETE_CONTACT}"
+        f"удалить / узнать пост {DELETE_CONTACT}\n\n"
+        f"📢 <a href='{CHANNEL_URL}'>{CHANNEL_NAME}</a>"
     )
 
     final_text = f"{original_text}\n\n{footer}" if original_text else footer
