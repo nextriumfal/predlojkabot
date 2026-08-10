@@ -25,6 +25,11 @@ CHANNEL_ID = -1003916335483
 CHANNEL_URL = "https://t.me/Freakcrimea"
 CHANNEL_NAME = "Фрики Крым"
 
+# Подпись к постам
+SUGGEST_BOT = "@Freakcrimeabot"
+DELETE_CONTACT = "@Triumfal @krymnft"
+FRIEND_LINK = "https://t.me/Freakcrimea"
+
 logging.basicConfig(level=logging.INFO)
 
 # --- БАЗА ДАННЫХ ---
@@ -217,7 +222,7 @@ async def view_banlist(callback: types.CallbackQuery):
     banned = cursor.fetchall()
 
     if not banned:
-        await callback.message.edit_text("📝 Список блокировок пуст!")  # Изменил, чтобы редактировать сообщение
+        await callback.message.edit_text("📝 Список блокировок пуст!")
         return await callback.answer("📝 Список блокировок пуст!", show_alert=True)
 
     builder = InlineKeyboardBuilder()
@@ -404,7 +409,14 @@ async def approve_post(callback: types.CallbackQuery):
             pass
         return
 
-    final_text = f"{original_text}\n\n📢 <a href='{CHANNEL_URL}'>{CHANNEL_NAME}</a>"
+    footer = (
+        f"📢 <a href='{CHANNEL_URL}'>{CHANNEL_NAME}</a>\n\n"
+        f"предложить пост : {SUGGEST_BOT}\n"
+        f"удалить / узнать пост {DELETE_CONTACT}\n"
+        f"ссылка для друга — {FRIEND_LINK}"
+    )
+
+    final_text = f"{original_text}\n\n{footer}" if original_text else footer
 
     try:
         if media_type == "photo":
@@ -457,7 +469,7 @@ async def reject_post(callback: types.CallbackQuery):
             pass
         return await callback.answer("⚠️ Пост не найден.", show_alert=True)
 
-    status = res[0]  # Исправлено: убрано лишнее смещение отступа
+    status = res[0]
 
     if status != "pending":
         await callback.answer(f"⚠️ Этот пост уже обработан! Статус: {status}", show_alert=True)
@@ -551,13 +563,11 @@ async def main():
     app = web.Application()
     app.router.add_get('/', web_handler)
 
-
     runner = web.AppRunner(app)
     await runner.setup()
 
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-
 
     logging.info(f"Bot polling started on port {PORT}...")
     await dp.start_polling(bot)
