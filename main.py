@@ -150,6 +150,53 @@ def get_admin_panel_kb():
     return builder.as_markup()
 
 
+# --- ОТОБРАЖЕНИЕ АДМИН ПАНЕЛИ ---
+async def show_admin_panel(user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
+    if user_id not in ADMIN_IDS and user_id not in VIP_ADMIN_IDS:
+        if callback:
+            return await callback.answer("🔒 У вас нет доступа к этой команде.", show_alert=True)
+        elif message:
+            return await message.answer("🔒 У вас нет доступа к этой команде.")
+
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'pending'")
+    pending_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'scheduled'")
+    scheduled_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'published'")
+    pub_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'rejected'")
+    rej_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM banned_users")
+    banned_count = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'")
+    open_tickets = cursor.fetchone()[0]
+
+    stats_text = (
+        f"📊 <b>Панель администратора предложки</b>\n\n"
+        f"👥 Всего пользователей в БД: {total_users}\n"
+        f"📩 Открытых тикетов (чатов): <b>{open_tickets}</b>\n"
+        f"⏳ На модерации: {pending_posts}\n"
+        f"📅 На таймере (отложено): <b>{scheduled_posts}</b>\n"
+        f"✅ Опубликовано всего: {pub_posts}\n"
+        f"❌ Отклонено всего: {rej_posts}\n"
+        f"🚫 В черном списке: {banned_count}"
+    )
+
+    if callback:
+        await callback.message.edit_text(stats_text, reply_markup=get_admin_panel_kb())
+        await callback.answer()
+    elif message:
+        await message.answer(stats_text, reply_markup=get_admin_panel_kb())
+
+
 # --- ПРОВЕРКА НА БАН ---
 def is_banned(user_id: int) -> bool:
     cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
@@ -194,48 +241,19 @@ async def start(message: types.Message):
     )
 
 
-# --- ПАНЕЛЬ /admin ---
+# --- ПАНЕЛЬ /admin И /stats ---
 @dp.message(Command("admin"))
 @dp.message(Command("stats"))
 async def admin_panel(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in VIP_ADMIN_IDS:
-        return await message.answer("🔒 У вас нет доступа к этой команде.")
-
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'pending'")
-    pending_posts = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'scheduled'")
-    scheduled_posts = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'published'")
-    pub_posts = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'rejected'")
-    rej_posts = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM banned_users")
-    banned_count = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'")
-    open_tickets = cursor.fetchone()[0]
-
-    stats_text = (
-        f"📊 <b>Панель администратора предложки</b>\n\n"
-        f"👥 Всего пользователей в БД: {total_users}\n"
-        f"📩 Открытых тикетов (чатов): <b>{open_tickets}</b>\n"
-        f"⏳ На модерации: {pending_posts}\n"
-        f"📅 На таймере (отложено): <b>{scheduled_posts}</b>\n"
-        f"✅ Опубликовано всего: {pub_posts}\n"
-        f"❌ Отклонено всего: {rej_posts}\n"
-        f"🚫 В черном списке: {banned_count}"
-    )
-    await message.answer(stats_text, reply_markup=get_admin_panel_kb())
+    await show_admin_panel(message.from_user.id, message=message)
 
 
-# --- СПИСОК ОТЛОЖЕННЫХ ПОСТОВ (ИДЕЯ №2: КАЛЕНДАРЬ / СПИСОК) ---
+@dp.callback_query(F.data == "back_to_admin")
+async def back_to_admin_callback(callback: types.CallbackQuery):
+    await show_admin_panel(callback.from_user.id, callback=callback)
+
+
+# --- СПИСОК ОТЛОЖЕННЫХ ПОСТОВ ---
 @dp.callback_query(F.data == "list_scheduled")
 async def list_scheduled_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -248,11 +266,13 @@ async def list_scheduled_callback(callback: types.CallbackQuery):
                       ORDER BY s.publish_time ASC''')
     sched_list = cursor.fetchall()
 
-    if not sched_list:
-        await callback.answer("📅 Запланированных постов нет!", show_alert=True)
-        return
-
     builder = InlineKeyboardBuilder()
+
+    if not sched_list:
+        builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
+        await callback.message.edit_text("📅 <b>Запланированных постов нет!</b>", reply_markup=builder.as_markup())
+        return await callback.answer()
+
     text = "📅 <b>Список отложенных постов:</b>\n\n"
 
     for sid, pid, ptime, ptext, mtype in sched_list:
@@ -299,6 +319,7 @@ async def view_scheduled_item_callback(callback: types.CallbackQuery):
     builder.button(text="🚀 Опубликовать сейчас", callback_data=f"pubnow_{sid}")
     builder.button(text="❌ Отменить публикацию", callback_data=f"cancelsched_{sid}")
     builder.button(text="🔙 К списку отложенных", callback_data="list_scheduled")
+    builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
     builder.adjust(1)
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
@@ -391,7 +412,7 @@ async def cancel_scheduled_callback(callback: types.CallbackQuery):
     await callback.answer("❌ Публикация отменена!")
 
 
-# --- ДЕТАЛЬНАЯ АНАЛИТИКА (ИДЕЯ №6) ---
+# --- ДЕТАЛЬНАЯ АНАЛИТИКА ---
 @dp.callback_query(F.data == "view_analytics")
 async def view_analytics_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -438,12 +459,6 @@ async def view_analytics_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data == "back_to_admin")
-async def back_to_admin_callback(callback: types.CallbackQuery):
-    await admin_panel(callback.message)
-    await callback.answer()
-
-
 # --- СПИСОК ТИКЕТОВ (ЧАТОВ) ---
 @dp.callback_query(F.data == "list_tickets")
 async def list_tickets_callback(callback: types.CallbackQuery):
@@ -458,11 +473,13 @@ async def list_tickets_callback(callback: types.CallbackQuery):
                       ORDER BY t.id DESC LIMIT 20''')
     tickets = cursor.fetchall()
 
-    if not tickets:
-        await callback.answer("📥 Открытых тикетов нет!", show_alert=True)
-        return
-
     builder = InlineKeyboardBuilder()
+
+    if not tickets:
+        builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
+        await callback.message.edit_text("📥 <b>Открытых тикетов нет!</b>", reply_markup=builder.as_markup())
+        return await callback.answer()
+
     text = "💬 <b>Список активных диалогов (Тикетов):</b>\n\n"
 
     for tid, uid, pid, uname, ptext in tickets:
@@ -471,6 +488,7 @@ async def list_tickets_callback(callback: types.CallbackQuery):
         text += f"• <b>Тикет #{tid}</b> | {user_disp} (Заявка #{pid})\n   └ <i>{preview}</i>\n\n"
         builder.button(text=f"💬 {user_disp} (Тикет #{tid})", callback_data=f"open_ticket_{tid}")
 
+    builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
     builder.adjust(1)
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
@@ -531,7 +549,8 @@ async def open_ticket_callback_by_id(callback: types.CallbackQuery, ticket_id: i
         builder.button(text="🏁 Завершить ТИКЕТ", callback_data=f"close_ticket_{tid}")
 
     builder.button(text="🔙 К списку тикетов", callback_data="list_tickets")
-    builder.adjust(1)
+    builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
+    builder.adjust(2, 1, 1)
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
@@ -641,9 +660,15 @@ async def close_ticket_callback(callback: types.CallbackQuery):
     except Exception as e:
         logging.error(f"Не удалось уведомить пользователя о закрытии тикета: {e}")
 
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 К списку тикетов", callback_data="list_tickets")
+    builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
+    builder.adjust(1)
+
     await callback.message.edit_text(
         f"🏁 <b>Тикет #{ticket_id} успешно завершен!</b>\n\n"
-        f"Пользователь может продолжать пользоваться предложкой и отправлять новые посты."
+        f"Пользователь может продолжать пользоваться предложкой и отправлять новые посты.",
+        reply_markup=builder.as_markup()
     )
     await callback.answer("🏁 Тикет завершен!")
 
@@ -770,7 +795,7 @@ async def do_sched_callback(callback: types.CallbackQuery):
     await callback.answer(f"⏰ Пост будет опубликован в {time_str}")
 
 
-# --- ВЫПУСК ОТЛОЖЕННЫХ ПОСТОВ (С ПОДДЕРЖКОЙ АЛЬБОМОВ) ---
+# --- ВЫПУСК ОТЛОЖЕННЫХ ПОСТОВ ---
 async def scheduled_publisher_loop():
     while True:
         try:
@@ -832,7 +857,7 @@ async def scheduled_publisher_loop():
         await asyncio.sleep(30)
 
 
-# --- ОБРАБОТКА И СБОРКА АЛЬБОМОВ (ИДЕЯ №4: MEDIA GROUP) ---
+# --- ОБРАБОТКА И СБОРКА АЛЬБОМОВ ---
 async def process_media_group_delayed(mg_id: str):
     await asyncio.sleep(1.5)
     if mg_id not in media_group_buffers:
@@ -922,7 +947,6 @@ async def handle_suggestion(message: types.Message):
     if message.text and message.text.startswith("/"):
         return
 
-    # Если отправлен альбом (MediaGroup)
     if message.media_group_id:
         mg_id = message.media_group_id
         if mg_id not in media_group_buffers:
@@ -936,7 +960,6 @@ async def handle_suggestion(message: types.Message):
         media_group_buffers[mg_id]['task'] = asyncio.create_task(process_media_group_delayed(mg_id))
         return
 
-    # Одиночное сообщение / медиа
     cursor.execute("SELECT id FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
                    (message.from_user.id,))
     active_ticket = cursor.fetchone()
@@ -1018,7 +1041,7 @@ async def handle_suggestion(message: types.Message):
             logging.error(f"Не удалось отправить админу {admin_id}: {e}")
 
 
-# --- ОБРАБОТКА ОДОБРЕНИЯ ПОСТА (С ПОДДЕРЖКОЙ АЛЬБОМОВ) ---
+# --- ОБРАБОТКА ОДОБРЕНИЯ ПОСТА ---
 @dp.callback_query(F.data.startswith("pub_"))
 async def approve_post(callback: types.CallbackQuery):
     data = callback.data.split("_")
@@ -1260,18 +1283,21 @@ async def view_banlist(callback: types.CallbackQuery):
     cursor.execute("SELECT user_id, username FROM banned_users LIMIT 30")
     banned = cursor.fetchall()
 
-    if not banned:
-        await callback.message.edit_text("📝 Список блокировок пуст!")
-        return await callback.answer("📝 Список блокировок пуст!", show_alert=True)
-
     builder = InlineKeyboardBuilder()
-    text = "📋 <b>Список заблокированных пользователей:</b>\n\n"
+
+    if not banned:
+        builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
+        await callback.message.edit_text("📝 <b>Список блокировок пуст!</b>", reply_markup=builder.as_markup())
+        return await callback.answer()
+
+    text = "📋 <b>Список заблокированных пользователей:</b>\n\nНажмите на кнопку ниже, чтобы удобно разбанить:\n\n"
 
     for uid, uname in banned:
-        mention = f"@{uname}" if uname != "None" else f"ID: {uid}"
-        text += f"• {mention} (ID: <code>{uid}</code>)\n"
-        builder.button(text=f"🔓 Разбан {uname if uname != 'None' else uid}", callback_data=f"unb_{uid}")
+        mention = f"@{uname}" if uname and uname != "None" else f"ID: {uid}"
+        text += f"• {mention} (<code>{uid}</code>)\n"
+        builder.button(text=f"🔓 Разбанить {uname if uname and uname != 'None' else uid}", callback_data=f"unb_{uid}")
 
+    builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
     builder.adjust(1)
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
