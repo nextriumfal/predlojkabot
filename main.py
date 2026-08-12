@@ -1,7 +1,9 @@
 import os
+import time
 import asyncio
 import sqlite3
 import logging
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -27,7 +29,7 @@ CHANNEL_NAME = "Фрики Крым"
 
 # Подпись к постам
 SUGGEST_BOT = "@Freakcrimeabot"
-DELETE_CONTACT = "@Triumfal @krymnft"
+DELETE_CONTACT = "@Triumfal"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -50,6 +52,39 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS users
 cursor.execute('''CREATE TABLE IF NOT EXISTS banned_users 
                   (user_id INTEGER PRIMARY KEY, 
                    username TEXT)''')
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS admin_messages 
+                  (admin_id INTEGER, 
+                   admin_msg_id INTEGER, 
+                   user_id INTEGER,
+                   PRIMARY KEY (admin_id, admin_msg_id))''')
+
+# Таблица для тикетов (чатов)
+cursor.execute('''CREATE TABLE IF NOT EXISTS tickets 
+                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                   user_id INTEGER, 
+                   post_id INTEGER, 
+                   status TEXT DEFAULT 'open',
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+# Таблица истории сообщений в тикетах
+cursor.execute('''CREATE TABLE IF NOT EXISTS ticket_messages 
+                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                   ticket_id INTEGER, 
+                   sender_type TEXT, 
+                   sender_id INTEGER, 
+                   sender_name TEXT, 
+                   text TEXT, 
+                   media_type TEXT, 
+                   file_id TEXT, 
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+# Таблица для отложенной публикации постов
+cursor.execute('''CREATE TABLE IF NOT EXISTS scheduled_posts 
+                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                   post_id INTEGER, 
+                   publish_time INTEGER)''')
+
 conn.commit()
 
 bot = Bot(
@@ -69,18 +104,28 @@ async def web_handler(request):
     return web.Response(text="Bot is running!")
 
 
-# --- СОСТОЯНИЯ ДЛЯ РАССЫЛКИ ---
+# --- СОСТОЯНИЯ ---
 class VipStates(StatesGroup):
     waiting_for_broadcast = State()
 
 
+class AdminStates(StatesGroup):
+    waiting_for_ticket_msg = State()
+    waiting_for_custom_time = State()
+
+
 # --- КНОПКИ ---
-def get_admin_kb(post_id, user_id):
+def get_admin_kb(post_id, user_id, ticket_id=None):
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Опубликовать", callback_data=f"pub_{post_id}_{user_id}")
+    builder.button(text="⏱ Отложить", callback_data=f"schedmenu_{post_id}_{user_id}")
     builder.button(text="❌ Отклонить", callback_data=f"rej_{post_id}_{user_id}")
+    if ticket_id:
+        builder.button(text="💬 Чат / История", callback_data=f"open_ticket_{ticket_id}")
+    else:
+        builder.button(text="💬 Чат с автором", callback_data=f"chat_{post_id}_{user_id}")
     builder.button(text="🚫 Забанить автора", callback_data=f"ban_{post_id}_{user_id}")
-    builder.adjust(2, 1)  # 2 кнопки в первом ряду, 1 во втором
+    builder.adjust(2, 2, 1)
     return builder.as_markup()
 
 
@@ -92,7 +137,9 @@ def get_user_more_kb():
 
 def get_admin_panel_kb():
     builder = InlineKeyboardBuilder()
+    builder.button(text="📥 Активные тикеты (Чаты)", callback_data="list_tickets")
     builder.button(text="📋 Список банов", callback_data="view_banlist")
+    builder.adjust(1, 1)
     return builder.as_markup()
 
 
@@ -106,6 +153,22 @@ def is_banned(user_id: int) -> bool:
 def register_user(user: types.User):
     cursor.execute("INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)",
                    (user.id, user.username or "None"))
+    conn.commit()
+
+
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ СОХРАНЕНИЯ СООБЩЕНИЙ МОДЕРАТОРА ---
+def save_admin_msg_mapping(admin_id: int, admin_msg_id: int, user_id: int):
+    cursor.execute("INSERT OR REPLACE INTO admin_messages (admin_id, admin_msg_id, user_id) VALUES (?, ?, ?)",
+                   (admin_id, admin_msg_id, user_id))
+    conn.commit()
+
+
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ЗАПИСИ В ИСТОРИЮ ТИКЕТА ---
+def log_ticket_message(ticket_id: int, sender_type: str, sender_id: int, sender_name: str, text: str, media_type: str, file_id: str):
+    cursor.execute(
+        "INSERT INTO ticket_messages (ticket_id, sender_type, sender_id, sender_name, text, media_type, file_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (ticket_id, sender_type, sender_id, sender_name, text, media_type, file_id)
+    )
     conn.commit()
 
 
@@ -131,12 +194,14 @@ async def admin_panel(message: types.Message):
     if message.from_user.id not in ADMIN_IDS and message.from_user.id not in VIP_ADMIN_IDS:
         return await message.answer("🔒 У вас нет доступа к этой команде.")
 
-    # Сбор статистики
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'pending'")
     pending_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'scheduled'")
+    scheduled_posts = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'published'")
     pub_posts = cursor.fetchone()[0]
@@ -147,15 +212,399 @@ async def admin_panel(message: types.Message):
     cursor.execute("SELECT COUNT(*) FROM banned_users")
     banned_count = cursor.fetchone()[0]
 
+    cursor.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'")
+    open_tickets = cursor.fetchone()[0]
+
     stats_text = (
         f"📊 <b>Панель администратора предложки</b>\n\n"
         f"👥 Всего пользователей в БД: {total_users}\n"
+        f"📩 Открытых тикетов (чатов): <b>{open_tickets}</b>\n"
         f"⏳ На модерации: {pending_posts}\n"
+        f"⏱ На таймере (отложено): {scheduled_posts}\n"
         f"✅ Опубликовано: {pub_posts}\n"
         f"❌ Отклонено: {rej_posts}\n"
-        f"🚫 В черном списке: {banned_count}"
+        f"🚫 В черном списке: {banned_count}\n\n"
+        f"💡 <b>Совет:</b> В разделе «Активные тикеты» сохраняется вся история переписки с анонимизацией администрации!"
     )
     await message.answer(stats_text, reply_markup=get_admin_panel_kb())
+
+
+# --- СПИСОК ТИКЕТОВ (ЧАТОВ) ---
+@dp.callback_query(F.data == "list_tickets")
+async def list_tickets_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
+
+    cursor.execute('''SELECT t.id, t.user_id, t.post_id, u.username, p.text 
+                      FROM tickets t 
+                      LEFT JOIN users u ON t.user_id = u.user_id 
+                      LEFT JOIN posts p ON t.post_id = p.id 
+                      WHERE t.status = 'open' 
+                      ORDER BY t.id DESC LIMIT 20''')
+    tickets = cursor.fetchall()
+
+    if not tickets:
+        await callback.answer("📥 Открытых тикетов нет!", show_alert=True)
+        return
+
+    builder = InlineKeyboardBuilder()
+    text = "💬 <b>Список активных диалогов (Тикетов):</b>\n\n"
+
+    for tid, uid, pid, uname, ptext in tickets:
+        user_disp = f"@{uname}" if uname and uname != "None" else f"ID {uid}"
+        preview = (ptext[:25] + "...") if ptext else "Медиафайл"
+        text += f"• <b>Тикет #{tid}</b> | {user_disp} (Заявка #{pid})\n   └ <i>{preview}</i>\n\n"
+        builder.button(text=f"💬 {user_disp} (Тикет #{tid})", callback_data=f"open_ticket_{tid}")
+
+    builder.adjust(1)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+# --- ПРОСМОТР И УПРАВЛЕНИЕ КОНКРЕТНЫМ ТИКЕТОМ С ПОДГРУЗКОЙ ИСТОРИИ ---
+@dp.callback_query(F.data.startswith("open_ticket_"))
+async def open_ticket_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
+
+    ticket_id = int(callback.data.split("_")[2])
+    await open_ticket_callback_by_id(callback, ticket_id)
+
+
+async def open_ticket_callback_by_id(callback: types.CallbackQuery, ticket_id: int):
+    cursor.execute('''SELECT t.id, t.user_id, t.post_id, t.status, u.username, p.text, p.status 
+                      FROM tickets t 
+                      LEFT JOIN users u ON t.user_id = u.user_id 
+                      LEFT JOIN posts p ON t.post_id = p.id 
+                      WHERE t.id = ?''', (ticket_id,))
+    ticket = cursor.fetchone()
+
+    if not ticket:
+        return await callback.answer("⚠️ Тикет не найден.", show_alert=True)
+
+    tid, uid, pid, t_status, uname, ptext, p_status = ticket
+    user_mention = f"@{uname}" if uname and uname != "None" else f"ID <code>{uid}</code>"
+
+    # Подгрузка истории сообщений тикета (АНОНИМНО ДЛЯ ВСЕХ АДМИНОВ)
+    cursor.execute('''SELECT sender_type, text, media_type, created_at 
+                      FROM ticket_messages 
+                      WHERE ticket_id = ? 
+                      ORDER BY id ASC LIMIT 15''', (tid,))
+    history = cursor.fetchall()
+
+    history_str = ""
+    if history:
+        history_str = "\n\n📜 <b>История переписки:</b>\n"
+        for stype, mtext, mtype, ctime in history:
+            sender_label = "👤 [Юзер]" if stype == "user" else "🛡 [Модератор]"
+            content = mtext if mtext else f"<i>[{mtype.upper()}]</i>"
+            history_str += f"• {sender_label}: {content}\n"
+    else:
+        history_str = "\n\n📜 <i>История сообщений пуста.</i>"
+
+    text = (
+        f"💬 <b>Управление Тикетом #{tid}</b>\n\n"
+        f"👤 <b>Пользователь:</b> {user_mention}\n"
+        f"🆔 <b>ID пользователя:</b> <code>{uid}</code>\n"
+        f"📝 <b>Заявка:</b> #{pid} (Статус поста: {p_status})\n"
+        f"📌 <b>Статус тикета:</b> {'🟢 Открыт' if t_status == 'open' else '🔴 Завершен'}"
+        f"{history_str}"
+    )
+
+    builder = InlineKeyboardBuilder()
+    if t_status == 'open':
+        builder.button(text="✍️ Написать в тикет", callback_data=f"reply_ticket_{tid}_{uid}")
+        builder.button(text="🏁 Завершить ТИКЕТ", callback_data=f"close_ticket_{tid}")
+
+    builder.button(text="🔙 К списку тикетов", callback_data="list_tickets")
+    builder.adjust(1)
+
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+# --- ВВОД СООБЩЕНИЯ В ТИКЕТ ---
+@dp.callback_query(F.data.startswith("reply_ticket_"))
+async def start_reply_ticket(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
+
+    data = callback.data.split("_")
+    ticket_id = int(data[2])
+    target_user_id = int(data[3])
+
+    await state.set_state(AdminStates.waiting_for_ticket_msg)
+    await state.update_data(ticket_id=ticket_id, target_user_id=target_user_id)
+
+    cancel_builder = InlineKeyboardBuilder()
+    cancel_builder.button(text="❌ Отмена", callback_data=f"open_ticket_{ticket_id}")
+
+    await callback.message.edit_text(
+        f"✍️ <b>Напишите сообщение для пользователя в Тикет #{ticket_id}:</b>\n\n"
+        f"Отправьте текст или медиафайл. Пользователь получит его анонимно от бота.",
+        reply_markup=cancel_builder.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(AdminStates.waiting_for_ticket_msg))
+async def process_ticket_admin_msg(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data.get("ticket_id")
+    target_user_id = data.get("target_user_id")
+
+    await state.clear()
+    admin = message.from_user
+    admin_mention = f"@{admin.username}" if admin.username else admin.full_name
+
+    text_content = message.text or message.caption or ""
+    media_type = "text"
+    file_id = None
+
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        file_id = message.video.file_id
+
+    # Заносим в историю тикета
+    log_ticket_message(ticket_id, "admin", admin.id, admin_mention, text_content, media_type, file_id)
+
+    try:
+        await bot.send_message(target_user_id, "💬 <b>Сообщение от администрации:</b>")
+        await bot.copy_message(
+            chat_id=target_user_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
+        await message.reply(f"✅ Сообщение отправлено в Тикет #{ticket_id}!")
+    except Exception as e:
+        return await message.reply(f"❌ Ошибка при отправке пользователю: {e}")
+
+    # Уведомляем остальных админов
+    admin_info = f"💬 <b>[Модератор в Тикет #{ticket_id} (Юзер <code>{target_user_id}</code>)]:</b>"
+
+    for admin_id in list(set(ADMIN_IDS + VIP_ADMIN_IDS)):
+        if admin_id != admin.id:
+            try:
+                head_msg = await bot.send_message(admin_id, admin_info)
+                copy_msg = await bot.copy_message(
+                    chat_id=admin_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id
+                )
+                save_admin_msg_mapping(admin_id, head_msg.message_id, target_user_id)
+                save_admin_msg_mapping(admin_id, copy_msg.message_id, target_user_id)
+            except Exception:
+                pass
+
+
+# --- КНОПКА "ЗАВЕРШИТЬ ТИКЕТ" ---
+@dp.callback_query(F.data.startswith("close_ticket_"))
+async def close_ticket_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
+
+    ticket_id = int(callback.data.split("_")[2])
+
+    cursor.execute("SELECT user_id, post_id FROM tickets WHERE id = ?", (ticket_id,))
+    ticket = cursor.fetchone()
+
+    if not ticket:
+        return await callback.answer("⚠️ Тикет не найден.", show_alert=True)
+
+    user_id, post_id = ticket
+
+    cursor.execute("UPDATE tickets SET status = 'closed' WHERE id = ?", (ticket_id,))
+    conn.commit()
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"🏁 <b>Ваш Тикет #{ticket_id} был завершен модератором.</b>\n\n"
+            f"Если у вас возникнут новые вопросы или вы захотите прислать еще один пост, просто отправьте сообщение боту!",
+            reply_markup=get_user_more_kb()
+        )
+    except Exception as e:
+        logging.error(f"Не удалось уведомить пользователя о закрытии тикета: {e}")
+
+    await callback.message.edit_text(
+        f"🏁 <b>Тикет #{ticket_id} успешно завершен!</b>\n\n"
+        f"Пользователь может продолжать пользоваться предложкой и отправлять новые посты."
+    )
+    await callback.answer("🏁 Тикет завершен!")
+
+
+# --- МЕНЮ ОТЛОЖЕННОЙ ПУБЛИКАЦИИ ---
+@dp.callback_query(F.data.startswith("schedmenu_"))
+async def sched_menu_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
+
+    data = callback.data.split("_")
+    post_id, user_id = data[1], data[2]
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⌨️ Указать свое время (ЧЧ:ММ)", callback_data=f"customsched_{post_id}_{user_id}")
+    builder.button(text="⏱ Через 1 час", callback_data=f"dosched_{post_id}_{user_id}_3600")
+    builder.button(text="⏱ Через 3 часа", callback_data=f"dosched_{post_id}_{user_id}_10800")
+    builder.button(text="⏱ Через 6 часов", callback_data=f"dosched_{post_id}_{user_id}_21600")
+    builder.button(text="⏱ Через 12 часов", callback_data=f"dosched_{post_id}_{user_id}_43200")
+    builder.button(text="⏱ Через 24 часа", callback_data=f"dosched_{post_id}_{user_id}_86400")
+    builder.button(text="🔙 Назад", callback_data=f"backpost_{post_id}_{user_id}")
+    builder.adjust(1, 2, 2, 1, 1)
+
+    await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("backpost_"))
+async def back_post_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    data = callback.data.split("_")
+    post_id, user_id = data[1], data[2]
+
+    cursor.execute("SELECT id FROM tickets WHERE user_id = ? AND post_id = ? AND status = 'open'", (user_id, post_id))
+    t_row = cursor.fetchone()
+    ticket_id = t_row[0] if t_row else None
+
+    await callback.message.edit_reply_markup(reply_markup=get_admin_kb(post_id, user_id, ticket_id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("customsched_"))
+async def custom_sched_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
+
+    data = callback.data.split("_")
+    post_id, user_id = int(data[1]), int(data[2])
+
+    await state.set_state(AdminStates.waiting_for_custom_time)
+    await state.update_data(post_id=post_id, user_id=user_id)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data=f"backpost_{post_id}_{user_id}")
+
+    await callback.message.edit_text(
+        "⌨️ <b>Введите точное время публикации в формате ЧЧ:ММ</b>\n"
+        "Например: <code>06:44</code> или <code>18:30</code>",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(AdminStates.waiting_for_custom_time))
+async def process_custom_time_input(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in VIP_ADMIN_IDS:
+        return
+
+    data = await state.get_data()
+    post_id = data.get("post_id")
+
+    time_raw = message.text.strip() if message.text else ""
+    try:
+        parsed_time = datetime.strptime(time_raw, "%H:%M")
+        now = datetime.now()
+        target_dt = now.replace(hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0)
+
+        if target_dt <= now:
+            target_dt += timedelta(days=1)
+
+        publish_time = int(target_dt.timestamp())
+        formatted_time = target_dt.strftime("%H:%M")
+
+        cursor.execute("SELECT status FROM posts WHERE id = ?", (post_id,))
+        res = cursor.fetchone()
+        if not res or res[0] != "pending":
+            await state.clear()
+            return await message.reply("⚠️ Пост уже обработан или не найден.")
+
+        cursor.execute("UPDATE posts SET status = 'scheduled' WHERE id = ?", (post_id,))
+        cursor.execute("INSERT INTO scheduled_posts (post_id, publish_time) VALUES (?, ?)", (post_id, publish_time))
+        conn.commit()
+
+        await state.clear()
+        await message.reply(f"⏰ Пост будет опубликован в {formatted_time}")
+
+    except ValueError:
+        await message.reply("⚠️ Неверный формат времени. Пожалуйста, введите время в формате <b>ЧЧ:ММ</b> (например, <code>06:44</code>):")
+
+
+@dp.callback_query(F.data.startswith("dosched_"))
+async def do_sched_callback(callback: types.CallbackQuery):
+    data = callback.data.split("_")
+    post_id, user_id, seconds = int(data[1]), int(data[2]), int(data[3])
+
+    cursor.execute("SELECT status FROM posts WHERE id = ?", (post_id,))
+    res = cursor.fetchone()
+    if not res or res[0] != "pending":
+        return await callback.answer("⚠️ Пост уже обработан или не найден.", show_alert=True)
+
+    publish_time = int(time.time()) + seconds
+    cursor.execute("UPDATE posts SET status = 'scheduled' WHERE id = ?", (post_id,))
+    cursor.execute("INSERT INTO scheduled_posts (post_id, publish_time) VALUES (?, ?)", (post_id, publish_time))
+    conn.commit()
+
+    time_str = time.strftime("%H:%M", time.localtime(publish_time))
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.message.reply(f"⏰ Пост будет опубликован в {time_str}")
+    await callback.answer(f"⏰ Пост будет опубликован в {time_str}")
+
+
+# --- ФОНОВЫЙ ПРОЦЕСС ДЛЯ ОТЛОЖЕННОЙ ПУБЛИКАЦИИ ---
+async def scheduled_publisher_loop():
+    while True:
+        try:
+            now = int(time.time())
+            cursor.execute('''SELECT s.id, s.post_id, p.user_id, p.text, p.file_id, p.media_type 
+                              FROM scheduled_posts s 
+                              JOIN posts p ON s.post_id = p.id 
+                              WHERE s.publish_time <= ? AND p.status = 'scheduled' ''', (now,))
+            due_posts = cursor.fetchall()
+
+            for sched_id, post_id, user_id, original_text, file_id, media_type in due_posts:
+                footer = (
+                    f"предложить пост : {SUGGEST_BOT}\n\n"
+                    f"удалить / узнать пост {DELETE_CONTACT}\n\n"
+                    f"📢 <a href='{CHANNEL_URL}'>{CHANNEL_NAME}</a>"
+                )
+                final_text = f"{original_text}\n\n{footer}" if original_text else footer
+
+                try:
+                    if media_type == "photo":
+                        await bot.send_photo(CHANNEL_ID, file_id, caption=final_text)
+                    elif media_type == "video":
+                        await bot.send_video(CHANNEL_ID, file_id, caption=final_text)
+                    else:
+                        await bot.send_message(CHANNEL_ID, final_text)
+
+                    cursor.execute("UPDATE posts SET status = 'published' WHERE id = ?", (post_id,))
+                    cursor.execute("DELETE FROM scheduled_posts WHERE id = ?", (sched_id,))
+                    conn.commit()
+
+                    try:
+                        await bot.send_message(
+                            user_id,
+                            "✅ Твой запланированный пост опубликован в канале!",
+                            reply_markup=get_user_more_kb()
+                        )
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    logging.error(f"Ошибка отложенной публикации поста #{post_id}: {e}")
+
+        except Exception as e:
+            logging.error(f"Ошибка в scheduled_publisher_loop: {e}")
+
+        await asyncio.sleep(30)
 
 
 # --- КОМАНДА РАЗБЛОКИРОВКИ ЧЕРЕЗ ТЕКСТ /unban ---
@@ -179,7 +628,6 @@ async def unban_user_command(message: types.Message):
         cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (target_id,))
         conn.commit()
 
-        # Пробуем уведомить пользователя
         try:
             await bot.send_message(target_id, "🔓 Администратор разблокировал вас в предложке.")
         except Exception:
@@ -207,7 +655,6 @@ async def unban_callback(callback: types.CallbackQuery):
         pass
 
     await callback.answer("🔓 Пользователь успешно разблокирован!")
-    # Обновляем список банов на экране
     await view_banlist(callback)
 
 
@@ -291,27 +738,118 @@ async def process_broadcast(message: types.Message, state: FSMContext):
                 message_id=message.message_id
             )
             success_count += 1
-            await asyncio.sleep(0.05)  # Защита от лимитов Telegram API
+            await asyncio.sleep(0.05)
         except Exception:
             pass
 
     await message.answer(f"📢 Рассылка завершена!\n✅ Успешно доставлено: {success_count}/{len(users)}")
 
 
-# --- ПРИЕМ ПРЕДЛОЖЕНИЙ ---
+# --- ОБРАБОТКА ИНЛАЙН-КНОПКИ "ЧАТ С АВТОРОМ" ---
+@dp.callback_query(F.data.startswith("chat_"))
+async def start_chat_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
+
+    data = callback.data.split("_")
+    post_id, user_id = int(data[1]), int(data[2])
+
+    cursor.execute("SELECT id FROM tickets WHERE user_id = ? AND post_id = ? AND status = 'open'", (user_id, post_id))
+    t_row = cursor.fetchone()
+
+    if t_row:
+        ticket_id = t_row[0]
+    else:
+        cursor.execute("INSERT INTO tickets (user_id, post_id, status) VALUES (?, ?, 'open')", (user_id, post_id))
+        ticket_id = cursor.lastrowid
+        conn.commit()
+
+    await open_ticket_callback_by_id(callback, ticket_id)
+
+
+# --- ОБРАБОТКА ОТВЕТОВ МОДЕРАТОРОВ ЧЕРЕЗ REPLIES (REPLY) ---
+@dp.message(F.reply_to_message, F.chat.type == "private")
+async def handle_admin_reply(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id not in VIP_ADMIN_IDS:
+        return
+
+    admin = message.from_user
+    admin_mention = f"@{admin.username}" if admin.username else admin.full_name
+    reply_msg_id = message.reply_to_message.message_id
+
+    cursor.execute("SELECT user_id FROM admin_messages WHERE admin_id = ? AND admin_msg_id = ?",
+                   (admin.id, reply_msg_id))
+    row = cursor.fetchone()
+
+    if not row:
+        return await message.reply("⚠️ Не удалось найти пользователя для ответа. Воспользуйтесь меню «Активные тикеты» или ответьте на свежее сообщение.")
+
+    target_user_id = row[0]
+
+    # Находим тикет
+    cursor.execute("SELECT id FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1", (target_user_id,))
+    t_row = cursor.fetchone()
+    ticket_id = t_row[0] if t_row else None
+
+    text_content = message.text or message.caption or ""
+    media_type = "text"
+    file_id = None
+
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        file_id = message.video.file_id
+
+    if ticket_id:
+        log_ticket_message(ticket_id, "admin", admin.id, admin_mention, text_content, media_type, file_id)
+
+    try:
+        await bot.send_message(target_user_id, "💬 <b>Сообщение от администрации:</b>")
+        await bot.copy_message(
+            chat_id=target_user_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
+        await message.reply("✅ Сообщение отправлено пользователю!")
+    except Exception as e:
+        return await message.reply(f"❌ Ошибка отправки пользователю: {e}")
+
+    admin_info = f"💬 <b>[Модератор ➔ Юзер <code>{target_user_id}</code>]:</b>"
+
+    for admin_id in list(set(ADMIN_IDS + VIP_ADMIN_IDS)):
+        if admin_id != admin.id:
+            try:
+                head_msg = await bot.send_message(admin_id, admin_info)
+                copy_msg = await bot.copy_message(
+                    chat_id=admin_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id
+                )
+                save_admin_msg_mapping(admin_id, head_msg.message_id, target_user_id)
+                save_admin_msg_mapping(admin_id, copy_msg.message_id, target_user_id)
+            except Exception:
+                pass
+
+
+# --- ПРИЕМ ПРЕДЛОЖЕНИЙ И СООБЩЕНИЙ ОТ ПОЛЬЗОВАТЕЛЕЙ ---
 @dp.message(F.chat.type == "private")
 async def handle_suggestion(message: types.Message):
-    # Если пользователь в бане — игнорируем
     if is_banned(message.from_user.id):
         return await message.answer("⚠️ Вы заблокированы в этой предложке.")
 
     register_user(message.from_user)
 
-    # Команды отсекаем
     if message.text and message.text.startswith("/"):
         return
 
-    # Определяем тип медиафайла и сохраняем информацию
+    # Проверяем, есть ли уже активный открытый тикет
+    cursor.execute("SELECT id FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
+                   (message.from_user.id,))
+    active_ticket = cursor.fetchone()
+
+    # Определяем тип медиафайла
     media_type = "text"
     file_id = None
     text_content = message.text or ""
@@ -325,17 +863,27 @@ async def handle_suggestion(message: types.Message):
         file_id = message.video.file_id
         text_content = message.caption or ""
 
-    # Запись в БД
+    # Сохраняем пост
     cursor.execute(
         "INSERT INTO posts (user_id, status, text, file_id, media_type) VALUES (?, ?, ?, ?, ?)",
         (message.from_user.id, "pending", text_content, file_id, media_type)
     )
     post_id = cursor.lastrowid
+
+    if active_ticket:
+        ticket_id = active_ticket[0]
+    else:
+        cursor.execute("INSERT INTO tickets (user_id, post_id, status) VALUES (?, ?, 'open')",
+                       (message.from_user.id, post_id))
+        ticket_id = cursor.lastrowid
+
     conn.commit()
 
-    await message.answer("🚀 Пост отправлен на модерацию!")
+    # Фиксируем сообщение пользователя в истории тикета
+    log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content, media_type, file_id)
 
-    # Формируем сообщение для админов (с данными автора)
+    await message.answer(f"🚀 Пост отправлен на модерацию! (Тикет #{ticket_id})")
+
     user_link = f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.full_name}</a>"
     username = f" (@{message.from_user.username})" if message.from_user.username else " (нет юзернейма)"
 
@@ -343,32 +891,37 @@ async def handle_suggestion(message: types.Message):
         f"{text_content}\n\n"
         f"👤 <b>Автор:</b> {user_link}{username}\n"
         f"🆔 ID: <code>{message.from_user.id}</code>\n"
-        f"📝 <b>Заявка #{post_id}</b>"
+        f"💬 <b>Тикет #{ticket_id}</b> | 📝 <b>Заявка #{post_id}</b>"
     )
 
-    # Рассылаем пост админам
-    for admin_id in ADMIN_IDS:
+    all_admins = list(set(ADMIN_IDS + VIP_ADMIN_IDS))
+    for admin_id in all_admins:
         try:
+            sent_msg = None
             if media_type == "photo":
-                await bot.send_photo(
+                sent_msg = await bot.send_photo(
                     chat_id=admin_id,
                     photo=file_id,
                     caption=admin_caption,
-                    reply_markup=get_admin_kb(post_id, message.from_user.id)
+                    reply_markup=get_admin_kb(post_id, message.from_user.id, ticket_id)
                 )
             elif media_type == "video":
-                await bot.send_video(
+                sent_msg = await bot.send_video(
                     chat_id=admin_id,
                     video=file_id,
                     caption=admin_caption,
-                    reply_markup=get_admin_kb(post_id, message.from_user.id)
+                    reply_markup=get_admin_kb(post_id, message.from_user.id, ticket_id)
                 )
             else:
-                await bot.send_message(
+                sent_msg = await bot.send_message(
                     chat_id=admin_id,
                     text=admin_caption,
-                    reply_markup=get_admin_kb(post_id, message.from_user.id)
+                    reply_markup=get_admin_kb(post_id, message.from_user.id, ticket_id)
                 )
+
+            if sent_msg:
+                save_admin_msg_mapping(admin_id, sent_msg.message_id, message.from_user.id)
+
         except Exception as e:
             logging.error(f"Не удалось отправить админу {admin_id}: {e}")
 
@@ -399,7 +952,6 @@ async def approve_post(callback: types.CallbackQuery):
             pass
         return
 
-    # Проверяем, не забанен ли автор на момент публикации
     if is_banned(int(user_id)):
         await callback.answer("⚠️ Автор этого поста находится в черном списке!", show_alert=True)
         try:
@@ -441,11 +993,7 @@ async def approve_post(callback: types.CallbackQuery):
         except Exception:
             pass
 
-        admin = callback.from_user
-        admin_mention = f"@{admin.username}" if admin.username else admin.full_name
-        admin_link = f"<a href='tg://user?id={admin.id}'>{admin_mention}</a>"
-
-        await callback.message.reply(f"🚀 Пост выложил администратор: {admin_link}")
+        await callback.message.reply("🚀 Пост опубликован модератором!")
 
     except Exception as e:
         await callback.answer(f"Ошибка при публикации: {e}", show_alert=True)
@@ -494,11 +1042,7 @@ async def reject_post(callback: types.CallbackQuery):
     except Exception:
         pass
 
-    admin = callback.from_user
-    admin_mention = f"@{admin.username}" if admin.username else admin.full_name
-    admin_link = f"<a href='tg://user?id={admin.id}'>{admin_mention}</a>"
-
-    await callback.message.reply(f"❌ Пост отклонил администратор: {admin_link}")
+    await callback.message.reply("❌ Пост отклонен модератором!")
 
 
 # --- ОБРАБОТКА БЛОКИРОВКИ ПОЛЬЗОВАТЕЛЯ ---
@@ -525,6 +1069,7 @@ async def ban_user_callback(callback: types.CallbackQuery):
     cursor.execute("INSERT OR REPLACE INTO banned_users (user_id, username) VALUES (?, ?)", (user_id, username))
 
     cursor.execute("UPDATE posts SET status = 'rejected' WHERE user_id = ? AND status = 'pending'", (user_id,))
+    cursor.execute("UPDATE tickets SET status = 'closed' WHERE user_id = ?", (user_id,))
     conn.commit()
 
     try:
@@ -537,11 +1082,7 @@ async def ban_user_callback(callback: types.CallbackQuery):
     except Exception:
         pass
 
-    admin = callback.from_user
-    admin_mention = f"@{admin.username}" if admin.username else admin.full_name
-    admin_link = f"<a href='tg://user?id={admin.id}'>{admin_mention}</a>"
-
-    await callback.message.reply(f"🚫 Автор поста заблокирован администратором: {admin_link}")
+    await callback.message.reply("🚫 Автор поста заблокирован модератором!")
     await callback.answer("🚫 Пользователь успешно забанен!")
 
 
@@ -557,7 +1098,6 @@ async def send_more_handler(callback: types.CallbackQuery):
 
 # --- ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА БОТА И ВЕБ-СЕРВЕРА ---
 async def main():
-    # Инициализация веб-приложения aiohttp
     app = web.Application()
     app.router.add_get('/', web_handler)
 
@@ -566,6 +1106,9 @@ async def main():
 
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
+
+    # Запуск фонового планировщика публикаций
+    asyncio.create_task(scheduled_publisher_loop())
 
     logging.info(f"Bot polling started on port {PORT}...")
     await dp.start_polling(bot)
