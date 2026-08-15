@@ -27,7 +27,6 @@ CHANNEL_ID = -1003916335483
 CHANNEL_URL = "https://t.me/Freakcrimea"
 CHANNEL_NAME = "Фрики Крым"
 
-# Подпись к постам
 SUGGEST_BOT = "@Freakcrimeabot"
 DELETE_CONTACT = "@Triumfal"
 
@@ -37,60 +36,68 @@ logging.basicConfig(level=logging.INFO)
 conn = sqlite3.connect('suggestions.db', check_same_thread=False)
 cursor = conn.cursor()
 
-cursor.execute('''CREATE TABLE IF NOT EXISTS posts 
-                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                   user_id INTEGER, 
-                   status TEXT,
-                   text TEXT,
-                   file_id TEXT,
-                   media_type TEXT,
-                   media_group_id TEXT,
-                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
-cursor.execute('''CREATE TABLE IF NOT EXISTS post_media 
-                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                   post_id INTEGER, 
-                   file_id TEXT, 
-                   media_type TEXT)''')
+def init_db():
+    tables = [
+        '''CREATE TABLE IF NOT EXISTS posts 
+           (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            user_id INTEGER, 
+            status TEXT, 
+            text TEXT, 
+            file_id TEXT, 
+            media_type TEXT, 
+            media_group_id TEXT, 
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
 
-cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                  (user_id INTEGER PRIMARY KEY, 
-                   username TEXT)''')
+        '''CREATE TABLE IF NOT EXISTS post_media 
+           (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            post_id INTEGER, 
+            file_id TEXT, 
+            media_type TEXT)''',
 
-cursor.execute('''CREATE TABLE IF NOT EXISTS banned_users 
-                  (user_id INTEGER PRIMARY KEY, 
-                   username TEXT)''')
+        '''CREATE TABLE IF NOT EXISTS users 
+           (user_id INTEGER PRIMARY KEY, 
+            username TEXT)''',
 
-cursor.execute('''CREATE TABLE IF NOT EXISTS admin_messages 
-                  (admin_id INTEGER, 
-                   admin_msg_id INTEGER, 
-                   user_id INTEGER,
-                   PRIMARY KEY (admin_id, admin_msg_id))''')
+        '''CREATE TABLE IF NOT EXISTS banned_users 
+           (user_id INTEGER PRIMARY KEY, 
+            username TEXT)''',
 
-cursor.execute('''CREATE TABLE IF NOT EXISTS tickets 
-                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                   user_id INTEGER, 
-                   post_id INTEGER, 
-                   status TEXT DEFAULT 'open',
-                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        '''CREATE TABLE IF NOT EXISTS admin_messages 
+           (admin_id INTEGER, 
+            admin_msg_id INTEGER, 
+            user_id INTEGER, 
+            PRIMARY KEY (admin_id, admin_msg_id))''',
 
-cursor.execute('''CREATE TABLE IF NOT EXISTS ticket_messages 
-                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                   ticket_id INTEGER, 
-                   sender_type TEXT, 
-                   sender_id INTEGER, 
-                   sender_name TEXT, 
-                   text TEXT, 
-                   media_type TEXT, 
-                   file_id TEXT, 
-                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        '''CREATE TABLE IF NOT EXISTS tickets 
+           (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            user_id INTEGER, 
+            post_id INTEGER, 
+            status TEXT DEFAULT 'open', 
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
 
-cursor.execute('''CREATE TABLE IF NOT EXISTS scheduled_posts 
-                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                   post_id INTEGER, 
-                   publish_time INTEGER)''')
+        '''CREATE TABLE IF NOT EXISTS ticket_messages 
+           (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            ticket_id INTEGER, 
+            sender_type TEXT, 
+            sender_id INTEGER, 
+            sender_name TEXT, 
+            text TEXT, 
+            media_type TEXT, 
+            file_id TEXT, 
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
 
-conn.commit()
+        '''CREATE TABLE IF NOT EXISTS scheduled_posts 
+           (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            post_id INTEGER, 
+            publish_time INTEGER)'''
+    ]
+    for table in tables:
+        cursor.execute(table)
+    conn.commit()
+
+
+init_db()
 
 bot = Bot(
     token=API_TOKEN,
@@ -104,7 +111,7 @@ dp = Dispatcher()
 # Буфер для сборки альбомов (MediaGroup)
 media_group_buffers = {}
 
-# Хранилище активных диалогов модераторов: admin_id -> ticket_id
+# Хранилище активных прямодиалоговых чатов админов: admin_id -> ticket_id
 active_admin_chats = {}
 
 
@@ -121,7 +128,7 @@ class AdminStates(StatesGroup):
     waiting_for_custom_time = State()
 
 
-# --- КНОПКИ ---
+# --- КНОПКИ КЛАВИАТУР ---
 def get_admin_kb(post_id, user_id, ticket_id=None):
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Опубликовать", callback_data=f"pub_{post_id}_{user_id}")
@@ -162,7 +169,34 @@ def get_active_chat_kb(ticket_id: int, post_id: int, user_id: int):
     return builder.as_markup()
 
 
-# --- ОТОБРАЖЕНИЕ АДМИН ПАНЕЛИ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БД ---
+def is_banned(user_id: int) -> bool:
+    cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
+    return cursor.fetchone() is not None
+
+
+def register_user(user: types.User):
+    cursor.execute("INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)",
+                   (user.id, user.username or "None"))
+    conn.commit()
+
+
+def save_admin_msg_mapping(admin_id: int, admin_msg_id: int, user_id: int):
+    cursor.execute("INSERT OR REPLACE INTO admin_messages (admin_id, admin_msg_id, user_id) VALUES (?, ?, ?)",
+                   (admin_id, admin_msg_id, user_id))
+    conn.commit()
+
+
+def log_ticket_message(ticket_id: int, sender_type: str, sender_id: int, sender_name: str, text: str, media_type: str,
+                       file_id: str):
+    cursor.execute(
+        "INSERT INTO ticket_messages (ticket_id, sender_type, sender_id, sender_name, text, media_type, file_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (ticket_id, sender_type, sender_id, sender_name, text, media_type, file_id)
+    )
+    conn.commit()
+
+
+# --- ОТОБРАЖЕНИЕ АДМИН-ПАНЕЛИ ---
 async def show_admin_panel(user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
     if user_id not in ADMIN_IDS and user_id not in VIP_ADMIN_IDS:
         if callback:
@@ -200,12 +234,12 @@ async def show_admin_panel(user_id: int, message: types.Message = None, callback
         f"✅ Опубликовано всего: {pub_posts}\n"
         f"❌ Отклонено всего: {rej_posts}\n"
         f"🚫 В черном списке: {banned_count}\n\n"
-        f"📖 <b>Мини-гайды и быстрые команды для чата:</b>\n"
+        f"📖 <b>Мини-гайды и быстрые команды:</b>\n"
         f"• <code>/chat 12</code> — войти в чат с Тикетом #12\n"
-        f"• <code>/pub</code> или <code>/publish</code> — опубликовать пост текущего чата\n"
-        f"• <code>/rej</code> или <code>/reject</code> — отклонить пост текущего чата\n"
+        f"• <code>/pub</code> — опубликовать пост активного тикета\n"
+        f"• <code>/rej</code> — отклонить пост активного тикета\n"
         f"• <code>/close</code> — завершить текущий тикет\n"
-        f"• <code>/exit</code> — выйти из режима чата\n\n"
+        f"• <code>/exit</code> — выйти из режима прямого чата\n\n"
         f"💡 <i>В режиме чата всё, что вы пишите боту, отправляется пользователю анонимно!</i>"
     )
 
@@ -216,35 +250,7 @@ async def show_admin_panel(user_id: int, message: types.Message = None, callback
         await message.answer(stats_text, reply_markup=get_admin_panel_kb())
 
 
-# --- ПРОВЕРКА НА БАН ---
-def is_banned(user_id: int) -> bool:
-    cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
-    return cursor.fetchone() is not None
-
-
-# --- РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ В БД ---
-def register_user(user: types.User):
-    cursor.execute("INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)",
-                   (user.id, user.username or "None"))
-    conn.commit()
-
-
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def save_admin_msg_mapping(admin_id: int, admin_msg_id: int, user_id: int):
-    cursor.execute("INSERT OR REPLACE INTO admin_messages (admin_id, admin_msg_id, user_id) VALUES (?, ?, ?)",
-                   (admin_id, admin_msg_id, user_id))
-    conn.commit()
-
-
-def log_ticket_message(ticket_id: int, sender_type: str, sender_id: int, sender_name: str, text: str, media_type: str, file_id: str):
-    cursor.execute(
-        "INSERT INTO ticket_messages (ticket_id, sender_type, sender_id, sender_name, text, media_type, file_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (ticket_id, sender_type, sender_id, sender_name, text, media_type, file_id)
-    )
-    conn.commit()
-
-
-# --- ОБЩИЕ КОМАНДЫ ---
+# --- КОМАНДА /start ---
 @dp.message(Command("start"))
 async def start(message: types.Message):
     if is_banned(message.from_user.id):
@@ -260,7 +266,7 @@ async def start(message: types.Message):
     )
 
 
-# --- ПАНЕЛЬ /admin И /stats ---
+# --- КОМАНДЫ АДМИНА ---
 @dp.message(Command("admin"))
 @dp.message(Command("stats"))
 async def admin_panel(message: types.Message):
@@ -272,7 +278,7 @@ async def back_to_admin_callback(callback: types.CallbackQuery):
     await show_admin_panel(callback.from_user.id, callback=callback)
 
 
-# --- УПРАВЛЕНИЕ РЕЖИМОМ ЧАТА КОМАНДАМИ АДМИНА ---
+# --- РЕЖИМ ЧАТА И КОМАНДЫ УПРАВЛЕНИЯ ---
 @dp.message(Command("chat"))
 async def cmd_chat(message: types.Message):
     if message.from_user.id not in ADMIN_IDS and message.from_user.id not in VIP_ADMIN_IDS:
@@ -291,12 +297,15 @@ async def cmd_chat(message: types.Message):
             return await message.answer("❌ Тикет не найден.")
 
         tid, uid, pid, t_status = row
+        if t_status != 'open':
+            return await message.answer(f"⚠️ Тикет #{tid} уже закрыт!")
+
         active_admin_chats[message.from_user.id] = tid
 
         await message.answer(
             f"💬 <b>Вы вошли в режим прямого чата с Тикетом #{tid}!</b>\n\n"
-            f"Все ваши обычные сообщения (текст, фото) будут сразу уходить пользователю.\n"
-            f"Команды: <code>/pub</code>, <code>/rej</code>, <code>/close</code>, <code>/exit</code>",
+            f"Все ваши обычные сообщения (текст, фото) теперь напрямую уходят автору анонимно.\n"
+            f"Быстрые команды: <code>/pub</code>, <code>/rej</code>, <code>/close</code>, <code>/exit</code>",
             reply_markup=get_active_chat_kb(tid, pid, uid)
         )
     except ValueError:
@@ -341,7 +350,7 @@ async def cmd_pub_active_ticket(message: types.Message):
         return await message.answer("❌ Тикет не найден.")
 
     post_id, user_id = row
-    await publish_post_by_id(post_id, user_id, message)
+    await publish_post_by_id(post_id, user_id, message=message)
 
 
 @dp.message(Command("rej"))
@@ -362,7 +371,7 @@ async def cmd_rej_active_ticket(message: types.Message):
         return await message.answer("❌ Тикет не найден.")
 
     post_id, user_id = row
-    await reject_post_by_id(post_id, user_id, message)
+    await reject_post_by_id(post_id, user_id, message=message)
 
 
 @dp.message(Command("close"))
@@ -558,9 +567,10 @@ async def view_analytics_callback(callback: types.CallbackQuery):
     cursor.execute("SELECT COUNT(*) FROM posts WHERE created_at >= datetime('now', '-7 days') AND status = 'published'")
     week_pub = cursor.fetchone()[0]
 
-    cursor.execute("SELECT strftime('%H', created_at) as hr, COUNT(*) as c FROM posts GROUP BY hr ORDER BY c DESC LIMIT 1")
+    cursor.execute(
+        "SELECT strftime('%H', created_at) as hr, COUNT(*) as c FROM posts GROUP BY hr ORDER BY c DESC LIMIT 1")
     peak_row = cursor.fetchone()
-    peak_hour = f"{peak_row[0]}:00 - {int(peak_row[0])+1:02d}:00" if peak_row and peak_row[0] else "Нет данных"
+    peak_hour = f"{peak_row[0]}:00 - {int(peak_row[0]) + 1:02d}:00" if peak_row and peak_row[0] else "Нет данных"
 
     cursor.execute("SELECT COUNT(*) FROM tickets WHERE status = 'closed'")
     closed_tickets = cursor.fetchone()[0]
@@ -584,7 +594,7 @@ async def view_analytics_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# --- СПИСОК ТИКЕТОВ (ЧАТОВ) ---
+# --- СПИСОК ТИКЕТОВ ---
 @dp.callback_query(F.data == "list_tickets")
 async def list_tickets_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -619,7 +629,7 @@ async def list_tickets_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# --- ПРОСМОТР И УПРАВЛЕНИЕ ТИКЕТОМ С ПОДГРУЗКОЙ ИСТОРИИ ---
+# --- ПРОСМОТР И УПРАВЛЕНИЕ ТИКЕТОМ ---
 @dp.callback_query(F.data.startswith("open_ticket_"))
 async def open_ticket_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -681,7 +691,6 @@ async def open_ticket_callback_by_id(callback: types.CallbackQuery, ticket_id: i
     await callback.answer()
 
 
-# --- ВХОД В РЕЖИМ ПРЯМОГО ЧАТА ---
 @dp.callback_query(F.data.startswith("enter_chat_"))
 async def enter_chat_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -700,9 +709,8 @@ async def enter_chat_callback(callback: types.CallbackQuery):
 
     await callback.message.edit_text(
         f"💬 <b>Вы вошли в режим прямого чата с Тикетом #{ticket_id}!</b>\n\n"
-        f"Каждое ваше сообщение теперь сразу уходит автору анонимно.\n"
-        f"Вы остаетесь в чате, пока не выйдете или не опубликуете/закроете пост.\n\n"
-        f"Команды в чате: <code>/pub</code>, <code>/rej</code>, <code>/close</code>, <code>/exit</code>",
+        f"Все ваши обычные сообщения теперь уходят пользователю анонимно.\n"
+        f"Быстрые команды: <code>/pub</code>, <code>/rej</code>, <code>/close</code>, <code>/exit</code>",
         reply_markup=get_active_chat_kb(ticket_id, post_id, user_id)
     )
     await callback.answer("💬 Вход в чат выполнен!")
@@ -713,11 +721,9 @@ async def enter_chat_callback(callback: types.CallbackQuery):
 async def handle_admin_chat_messages(message: types.Message):
     admin_id = message.from_user.id
 
-    # Пропускаем команды
     if message.text and message.text.startswith("/"):
         return
 
-    # Если админ зашел в активный чат тикета
     if admin_id in active_admin_chats:
         ticket_id = active_admin_chats[admin_id]
 
@@ -758,7 +764,6 @@ async def handle_admin_chat_messages(message: types.Message):
         except Exception as e:
             await message.reply(f"❌ Ошибка отправки пользователю: {e}")
 
-        # Уведомляем других админов
         admin_info = f"💬 <b>[Модератор в Тикет #{ticket_id} (Юзер <code>{target_user_id}</code>)]:</b>"
         for aid in list(set(ADMIN_IDS + VIP_ADMIN_IDS)):
             if aid != admin_id:
@@ -776,7 +781,7 @@ async def handle_admin_chat_messages(message: types.Message):
         return
 
 
-# --- ФУНКЦИЯ И КНОПКА "ЗАВЕРШИТЬ ТИКЕТ" ---
+# --- ЗАКРЫТИЕ ТИКЕТА ---
 async def close_ticket_by_id(ticket_id: int, callback: types.CallbackQuery = None, message: types.Message = None):
     cursor.execute("SELECT user_id, post_id FROM tickets WHERE id = ?", (ticket_id,))
     ticket = cursor.fetchone()
@@ -793,7 +798,6 @@ async def close_ticket_by_id(ticket_id: int, callback: types.CallbackQuery = Non
     cursor.execute("UPDATE tickets SET status = 'closed' WHERE id = ?", (ticket_id,))
     conn.commit()
 
-    # Снимаем активный чат админов с этого тикета
     for aid, tid in list(active_admin_chats.items()):
         if tid == ticket_id:
             active_admin_chats.pop(aid, None)
@@ -927,7 +931,8 @@ async def process_custom_time_input(message: types.Message, state: FSMContext):
         await message.reply(f"⏰ Пост будет опубликован в {formatted_time}")
 
     except ValueError:
-        await message.reply("⚠️ Неверный формат времени. Пожалуйста, введите время в формате <b>ЧЧ:ММ</b> (например, <code>06:44</code>):")
+        await message.reply(
+            "⚠️ Неверный формат времени. Пожалуйста, введите время в формате <b>ЧЧ:ММ</b> (например, <code>06:44</code>):")
 
 
 @dp.callback_query(F.data.startswith("dosched_"))
@@ -956,7 +961,7 @@ async def do_sched_callback(callback: types.CallbackQuery):
     await callback.answer(f"⏰ Пост будет опубликован в {time_str}")
 
 
-# --- ВЫПУСК ОТЛОЖЕННЫХ ПОСТОВ ---
+# --- ФОНОВЫЙ ПЛАНИРОВЩИК ---
 async def scheduled_publisher_loop():
     while True:
         try:
@@ -1018,7 +1023,7 @@ async def scheduled_publisher_loop():
         await asyncio.sleep(30)
 
 
-# --- ОБРАБОТКА И СБОРКА АЛЬБОМОВ ---
+# --- ОБРАБОТКА АЛЬБОМОВ ---
 async def process_media_group_delayed(mg_id: str):
     await asyncio.sleep(1.5)
     if mg_id not in media_group_buffers:
@@ -1035,13 +1040,13 @@ async def process_media_group_delayed(mg_id: str):
             text_content = m.caption
             break
 
-    # ПРОВЕРЯЕМ, ЕСТЬ ЛИ АКТИВНЫЙ ТИКЕТ У ПОЛЬЗОВАТЕЛЯ
     cursor.execute("SELECT id FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1", (user.id,))
     active_ticket = cursor.fetchone()
 
     if active_ticket:
         ticket_id = active_ticket[0]
-        log_ticket_message(ticket_id, "user", user.id, user.full_name, text_content or "[Альбом фотографий]", "album", None)
+        log_ticket_message(ticket_id, "user", user.id, user.full_name, text_content or "[Альбом фотографий]", "album",
+                           None)
 
         all_admins = list(set(ADMIN_IDS + VIP_ADMIN_IDS))
         for admin_id in all_admins:
@@ -1058,22 +1063,23 @@ async def process_media_group_delayed(mg_id: str):
                 for sm in sent_msgs:
                     save_admin_msg_mapping(admin_id, sm.message_id, user.id)
             except Exception as e:
-                logging.error(f"Не удалось переслать альбом в открытый тикет админу {admin_id}: {e}")
+                logging.error(f"Не удалось переслать альбом админу {admin_id}: {e}")
 
         await first_msg.answer("💬 Ваше сообщение с альбомом добавлено в текущий диалог!")
         return
 
-    # ЕСЛИ АКТИВНОГО ТИКЕТА НЕТ — СОЗДАЕМ НОВЫЙ ПОСТ И ТИКЕТ
     cursor.execute(
         "INSERT INTO posts (user_id, status, text, file_id, media_type, media_group_id) VALUES (?, ?, ?, ?, ?, ?)",
-        (user.id, "pending", text_content, messages[0].photo[-1].file_id if messages[0].photo else messages[0].video.file_id, "album", mg_id)
+        (user.id, "pending", text_content,
+         messages[0].photo[-1].file_id if messages[0].photo else messages[0].video.file_id, "album", mg_id)
     )
     post_id = cursor.lastrowid
 
     for m in messages:
         m_type = "photo" if m.photo else "video"
         f_id = m.photo[-1].file_id if m.photo else m.video.file_id
-        cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)", (post_id, f_id, m_type))
+        cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)",
+                       (post_id, f_id, m_type))
 
     cursor.execute("INSERT INTO tickets (user_id, post_id, status) VALUES (?, ?, 'open')", (user.id, post_id))
     ticket_id = cursor.lastrowid
@@ -1130,17 +1136,13 @@ async def handle_suggestion(message: types.Message):
     if message.text and message.text.startswith("/"):
         return
 
-    # Проверяем, есть ли уже активный ОТКРЫТЫЙ тикет у пользователя
     cursor.execute("SELECT id FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
                    (message.from_user.id,))
     active_ticket = cursor.fetchone()
 
-    # 1. ЕСЛИ У ПОЛЬЗОВАТЕЛЯ УЖЕ ЕСТЬ ОТКРЫТЫЙ ТИКЕТ:
-    # Все новые сообщения идут прямиком в текущий тикет без создания новых заявок!
     if active_ticket:
         ticket_id = active_ticket[0]
 
-        # Игнорируем media_group_id если это альбом (он обрабатывается отдельно)
         if message.media_group_id:
             mg_id = message.media_group_id
             if mg_id not in media_group_buffers:
@@ -1164,9 +1166,9 @@ async def handle_suggestion(message: types.Message):
             media_type = "video"
             file_id = message.video.file_id
 
-        log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content, media_type, file_id)
+        log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content,
+                           media_type, file_id)
 
-        # Пересылаем модераторам как обычное сообщение диалога
         user_info = f"💬 <b>[Тикет #{ticket_id} | Пользователь {message.from_user.full_name}]:</b>"
         all_admins = list(set(ADMIN_IDS + VIP_ADMIN_IDS))
 
@@ -1181,12 +1183,11 @@ async def handle_suggestion(message: types.Message):
                 save_admin_msg_mapping(admin_id, head_msg.message_id, message.from_user.id)
                 save_admin_msg_mapping(admin_id, copy_msg.message_id, message.from_user.id)
             except Exception as e:
-                logging.error(f"Не удалось отправить сообщение пользователя админу {admin_id}: {e}")
+                logging.error(f"Не удалось переслать сообщение админу {admin_id}: {e}")
 
         await message.answer("💬 Ваше сообщение добавлено в текущий диалог с администрацией!")
         return
 
-    # 2. ЕСЛИ АКТИВНОГО ТИКЕТА НЕТ: СОЗДАЕМ НОВЫЙ ПОСТ И ТИКЕТ
     if message.media_group_id:
         mg_id = message.media_group_id
         if mg_id not in media_group_buffers:
@@ -1220,14 +1221,16 @@ async def handle_suggestion(message: types.Message):
     post_id = cursor.lastrowid
 
     if file_id:
-        cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)", (post_id, file_id, media_type))
+        cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)",
+                       (post_id, file_id, media_type))
 
     cursor.execute("INSERT INTO tickets (user_id, post_id, status) VALUES (?, ?, 'open')",
                    (message.from_user.id, post_id))
     ticket_id = cursor.lastrowid
     conn.commit()
 
-    log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content, media_type, file_id)
+    log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content, media_type,
+                       file_id)
 
     await message.answer(f"🚀 Пост отправлен на модерацию! (Тикет #{ticket_id})")
 
@@ -1274,7 +1277,8 @@ async def handle_suggestion(message: types.Message):
 
 
 # --- ФУНКЦИЯ ПУБЛИКАЦИИ ПОСТА И ЗАКРЫТИЯ ТИКЕТА ---
-async def publish_post_by_id(post_id: int, user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
+async def publish_post_by_id(post_id: int, user_id: int, message: types.Message = None,
+                             callback: types.CallbackQuery = None):
     cursor.execute("SELECT status, text, file_id, media_type FROM posts WHERE id = ?", (post_id,))
     res = cursor.fetchone()
 
@@ -1335,7 +1339,6 @@ async def publish_post_by_id(post_id: int, user_id: int, message: types.Message 
         cursor.execute("UPDATE tickets SET status = 'closed' WHERE post_id = ?", (post_id,))
         conn.commit()
 
-        # Снимаем режим чата у всех админов для этого тикета
         for aid, tid in list(active_admin_chats.items()):
             cursor.execute("SELECT post_id FROM tickets WHERE id = ?", (tid,))
             t_post = cursor.fetchone()
@@ -1375,7 +1378,8 @@ async def approve_post(callback: types.CallbackQuery):
 
 
 # --- ФУНКЦИЯ И КНОПКА ОТКЛОНЕНИЯ ПОСТА ---
-async def reject_post_by_id(post_id: int, user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
+async def reject_post_by_id(post_id: int, user_id: int, message: types.Message = None,
+                            callback: types.CallbackQuery = None):
     cursor.execute("SELECT status FROM posts WHERE id = ?", (post_id,))
     res = cursor.fetchone()
 
@@ -1399,7 +1403,6 @@ async def reject_post_by_id(post_id: int, user_id: int, message: types.Message =
     cursor.execute("UPDATE tickets SET status = 'closed' WHERE post_id = ?", (post_id,))
     conn.commit()
 
-    # Снимаем режим чата у всех админов
     for aid, tid in list(active_admin_chats.items()):
         cursor.execute("SELECT post_id FROM tickets WHERE id = ?", (tid,))
         t_post = cursor.fetchone()
@@ -1454,7 +1457,6 @@ async def ban_user_callback(callback: types.CallbackQuery):
     username = res_user[0] if res_user else "None"
 
     cursor.execute("INSERT OR REPLACE INTO banned_users (user_id, username) VALUES (?, ?)", (user_id, username))
-
     cursor.execute("UPDATE posts SET status = 'rejected' WHERE user_id = ? AND status = 'pending'", (user_id,))
     cursor.execute("UPDATE tickets SET status = 'closed' WHERE user_id = ?", (user_id,))
     conn.commit()
@@ -1622,7 +1624,7 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     await message.answer(f"📢 Рассылка завершена!\n✅ Успешно доставлено: {success_count}/{len(users)}")
 
 
-# --- ОБРАБОТКА ИНЛАЙН-КНОПКИ "ЧАТ С АВТОРОМ" ---
+# --- ИНЛАЙН-КНОПКА "ЧАТ С АВТОРОМ" ---
 @dp.callback_query(F.data.startswith("chat_"))
 async def start_chat_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -1651,7 +1653,7 @@ async def start_chat_callback(callback: types.CallbackQuery):
     await callback.answer("💬 Вход в чат выполнен!")
 
 
-# --- ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА БОТА И ВЕБ-СЕРВЕРА ---
+# --- ЗАПУСК ВЕБ-СЕРВЕРА И ПОЛЛИНГА ---
 async def main():
     app = web.Application()
     app.router.add_get('/', web_handler)
