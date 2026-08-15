@@ -36,7 +36,6 @@ logging.basicConfig(level=logging.INFO)
 conn = sqlite3.connect('suggestions.db', check_same_thread=False)
 cursor = conn.cursor()
 
-
 def init_db():
     tables = [
         '''CREATE TABLE IF NOT EXISTS posts 
@@ -48,34 +47,34 @@ def init_db():
             media_type TEXT, 
             media_group_id TEXT, 
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
-
+        
         '''CREATE TABLE IF NOT EXISTS post_media 
            (id INTEGER PRIMARY KEY AUTOINCREMENT, 
             post_id INTEGER, 
             file_id TEXT, 
             media_type TEXT)''',
-
+        
         '''CREATE TABLE IF NOT EXISTS users 
            (user_id INTEGER PRIMARY KEY, 
             username TEXT)''',
-
+        
         '''CREATE TABLE IF NOT EXISTS banned_users 
            (user_id INTEGER PRIMARY KEY, 
             username TEXT)''',
-
+        
         '''CREATE TABLE IF NOT EXISTS admin_messages 
            (admin_id INTEGER, 
             admin_msg_id INTEGER, 
             user_id INTEGER, 
             PRIMARY KEY (admin_id, admin_msg_id))''',
-
+        
         '''CREATE TABLE IF NOT EXISTS tickets 
            (id INTEGER PRIMARY KEY AUTOINCREMENT, 
             user_id INTEGER, 
             post_id INTEGER, 
             status TEXT DEFAULT 'open', 
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
-
+        
         '''CREATE TABLE IF NOT EXISTS ticket_messages 
            (id INTEGER PRIMARY KEY AUTOINCREMENT, 
             ticket_id INTEGER, 
@@ -86,7 +85,7 @@ def init_db():
             media_type TEXT, 
             file_id TEXT, 
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
-
+        
         '''CREATE TABLE IF NOT EXISTS scheduled_posts 
            (id INTEGER PRIMARY KEY AUTOINCREMENT, 
             post_id INTEGER, 
@@ -95,7 +94,6 @@ def init_db():
     for table in tables:
         cursor.execute(table)
     conn.commit()
-
 
 init_db()
 
@@ -114,19 +112,15 @@ media_group_buffers = {}
 # Хранилище активных прямодиалоговых чатов админов: admin_id -> ticket_id
 active_admin_chats = {}
 
-
 async def web_handler(request):
     return web.Response(text="Bot is running!")
-
 
 # --- СОСТОЯНИЯ ---
 class VipStates(StatesGroup):
     waiting_for_broadcast = State()
 
-
 class AdminStates(StatesGroup):
     waiting_for_custom_time = State()
-
 
 # --- КНОПКИ КЛАВИАТУР ---
 def get_admin_kb(post_id, user_id, ticket_id=None):
@@ -142,12 +136,10 @@ def get_admin_kb(post_id, user_id, ticket_id=None):
     builder.adjust(2, 2, 1)
     return builder.as_markup()
 
-
 def get_user_more_kb():
     builder = InlineKeyboardBuilder()
     builder.button(text="✍️ Отправить еще один пост", callback_data="send_more")
     return builder.as_markup()
-
 
 def get_admin_panel_kb():
     builder = InlineKeyboardBuilder()
@@ -158,7 +150,6 @@ def get_admin_panel_kb():
     builder.adjust(1, 1, 1, 1)
     return builder.as_markup()
 
-
 def get_active_chat_kb(ticket_id: int, post_id: int, user_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="🚪 Выйти из чата", callback_data=f"exitchat_{ticket_id}")
@@ -168,33 +159,27 @@ def get_active_chat_kb(ticket_id: int, post_id: int, user_id: int):
     builder.adjust(1, 2, 1)
     return builder.as_markup()
 
-
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БД ---
 def is_banned(user_id: int) -> bool:
     cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
     return cursor.fetchone() is not None
-
 
 def register_user(user: types.User):
     cursor.execute("INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)",
                    (user.id, user.username or "None"))
     conn.commit()
 
-
 def save_admin_msg_mapping(admin_id: int, admin_msg_id: int, user_id: int):
     cursor.execute("INSERT OR REPLACE INTO admin_messages (admin_id, admin_msg_id, user_id) VALUES (?, ?, ?)",
                    (admin_id, admin_msg_id, user_id))
     conn.commit()
 
-
-def log_ticket_message(ticket_id: int, sender_type: str, sender_id: int, sender_name: str, text: str, media_type: str,
-                       file_id: str):
+def log_ticket_message(ticket_id: int, sender_type: str, sender_id: int, sender_name: str, text: str, media_type: str, file_id: str):
     cursor.execute(
         "INSERT INTO ticket_messages (ticket_id, sender_type, sender_id, sender_name, text, media_type, file_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (ticket_id, sender_type, sender_id, sender_name, text, media_type, file_id)
     )
     conn.commit()
-
 
 # --- ОТОБРАЖЕНИЕ АДМИН-ПАНЕЛИ ---
 async def show_admin_panel(user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
@@ -249,7 +234,6 @@ async def show_admin_panel(user_id: int, message: types.Message = None, callback
     elif message:
         await message.answer(stats_text, reply_markup=get_admin_panel_kb())
 
-
 # --- КОМАНДА /start ---
 @dp.message(Command("start"))
 async def start(message: types.Message):
@@ -265,18 +249,15 @@ async def start(message: types.Message):
         "Если вдруг вы получили уведомление, но не увидели пост, напишите людям из отдела связи Фрики Крыма."
     )
 
-
 # --- КОМАНДЫ АДМИНА ---
 @dp.message(Command("admin"))
 @dp.message(Command("stats"))
 async def admin_panel(message: types.Message):
     await show_admin_panel(message.from_user.id, message=message)
 
-
 @dp.callback_query(F.data == "back_to_admin")
 async def back_to_admin_callback(callback: types.CallbackQuery):
     await show_admin_panel(callback.from_user.id, callback=callback)
-
 
 # --- РЕЖИМ ЧАТА И КОМАНДЫ УПРАВЛЕНИЯ ---
 @dp.message(Command("chat"))
@@ -311,7 +292,6 @@ async def cmd_chat(message: types.Message):
     except ValueError:
         await message.answer("⚠️ Номер тикета должен состоять из цифр.")
 
-
 @dp.message(Command("exit"))
 async def cmd_exit_chat(message: types.Message):
     admin_id = message.from_user.id
@@ -321,7 +301,6 @@ async def cmd_exit_chat(message: types.Message):
     else:
         await message.answer("ℹ️ Вы не находитесь в режиме прямого чата.")
 
-
 @dp.callback_query(F.data.startswith("exitchat_"))
 async def callback_exit_chat(callback: types.CallbackQuery):
     admin_id = callback.from_user.id
@@ -330,7 +309,6 @@ async def callback_exit_chat(callback: types.CallbackQuery):
         await callback.message.answer(f"🚪 Вы вышли из чата Тикета #{tid}.")
 
     await show_admin_panel(admin_id, callback=callback)
-
 
 @dp.message(Command("pub"))
 @dp.message(Command("publish"))
@@ -352,7 +330,6 @@ async def cmd_pub_active_ticket(message: types.Message):
     post_id, user_id = row
     await publish_post_by_id(post_id, user_id, message=message)
 
-
 @dp.message(Command("rej"))
 @dp.message(Command("reject"))
 async def cmd_rej_active_ticket(message: types.Message):
@@ -373,7 +350,6 @@ async def cmd_rej_active_ticket(message: types.Message):
     post_id, user_id = row
     await reject_post_by_id(post_id, user_id, message=message)
 
-
 @dp.message(Command("close"))
 async def cmd_close_active_ticket(message: types.Message):
     admin_id = message.from_user.id
@@ -385,7 +361,6 @@ async def cmd_close_active_ticket(message: types.Message):
 
     ticket_id = active_admin_chats[admin_id]
     await close_ticket_by_id(ticket_id, message=message)
-
 
 # --- СПИСОК ОТЛОЖЕННЫХ ПОСТОВ ---
 @dp.callback_query(F.data == "list_scheduled")
@@ -420,7 +395,6 @@ async def list_scheduled_callback(callback: types.CallbackQuery):
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
-
 
 @dp.callback_query(F.data.startswith("viewsched_"))
 async def view_scheduled_item_callback(callback: types.CallbackQuery):
@@ -458,7 +432,6 @@ async def view_scheduled_item_callback(callback: types.CallbackQuery):
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
-
 
 @dp.callback_query(F.data.startswith("pubnow_"))
 async def pub_now_scheduled_callback(callback: types.CallbackQuery):
@@ -526,7 +499,6 @@ async def pub_now_scheduled_callback(callback: types.CallbackQuery):
     except Exception as e:
         await callback.answer(f"Ошибка при публикации: {e}", show_alert=True)
 
-
 @dp.callback_query(F.data.startswith("cancelsched_"))
 async def cancel_scheduled_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -544,7 +516,6 @@ async def cancel_scheduled_callback(callback: types.CallbackQuery):
 
     await callback.message.edit_text("❌ Запланированная публикация отменена.")
     await callback.answer("❌ Публикация отменена!")
-
 
 # --- ДЕТАЛЬНАЯ АНАЛИТИКА ---
 @dp.callback_query(F.data == "view_analytics")
@@ -567,10 +538,9 @@ async def view_analytics_callback(callback: types.CallbackQuery):
     cursor.execute("SELECT COUNT(*) FROM posts WHERE created_at >= datetime('now', '-7 days') AND status = 'published'")
     week_pub = cursor.fetchone()[0]
 
-    cursor.execute(
-        "SELECT strftime('%H', created_at) as hr, COUNT(*) as c FROM posts GROUP BY hr ORDER BY c DESC LIMIT 1")
+    cursor.execute("SELECT strftime('%H', created_at) as hr, COUNT(*) as c FROM posts GROUP BY hr ORDER BY c DESC LIMIT 1")
     peak_row = cursor.fetchone()
-    peak_hour = f"{peak_row[0]}:00 - {int(peak_row[0]) + 1:02d}:00" if peak_row and peak_row[0] else "Нет данных"
+    peak_hour = f"{peak_row[0]}:00 - {int(peak_row[0])+1:02d}:00" if peak_row and peak_row[0] else "Нет данных"
 
     cursor.execute("SELECT COUNT(*) FROM tickets WHERE status = 'closed'")
     closed_tickets = cursor.fetchone()[0]
@@ -592,7 +562,6 @@ async def view_analytics_callback(callback: types.CallbackQuery):
     builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
     await callback.message.edit_text(analytics_text, reply_markup=builder.as_markup())
     await callback.answer()
-
 
 # --- СПИСОК ТИКЕТОВ ---
 @dp.callback_query(F.data == "list_tickets")
@@ -628,7 +597,6 @@ async def list_tickets_callback(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-
 # --- ПРОСМОТР И УПРАВЛЕНИЕ ТИКЕТОМ ---
 @dp.callback_query(F.data.startswith("open_ticket_"))
 async def open_ticket_callback(callback: types.CallbackQuery):
@@ -637,7 +605,6 @@ async def open_ticket_callback(callback: types.CallbackQuery):
 
     ticket_id = int(callback.data.split("_")[2])
     await open_ticket_callback_by_id(callback, ticket_id)
-
 
 async def open_ticket_callback_by_id(callback: types.CallbackQuery, ticket_id: int):
     cursor.execute('''SELECT t.id, t.user_id, t.post_id, t.status, u.username, p.text, p.status 
@@ -690,7 +657,6 @@ async def open_ticket_callback_by_id(callback: types.CallbackQuery, ticket_id: i
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("enter_chat_"))
 async def enter_chat_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -710,76 +676,75 @@ async def enter_chat_callback(callback: types.CallbackQuery):
     await callback.message.edit_text(
         f"💬 <b>Вы вошли в режим прямого чата с Тикетом #{ticket_id}!</b>\n\n"
         f"Все ваши обычные сообщения теперь уходят пользователю анонимно.\n"
-        f"Быстрые команды: <code>/pub</code>, <code>/rej</code>, <code>/close</code>, <code>/exit</code>",
+        f"Команды: <code>/pub</code>, <code>/rej</code>, <code>/close</code>, <code>/exit</code>",
         reply_markup=get_active_chat_kb(ticket_id, post_id, user_id)
     )
     await callback.answer("💬 Вход в чат выполнен!")
 
-
 # --- ОБРАБОТКА ВСЕХ СООБЩЕНИЙ МОДЕРАТОРА В РЕЖИМЕ ЧАТА ---
-@dp.message(F.chat.type == "private", lambda m: m.from_user.id in ADMIN_IDS or m.from_user.id in VIP_ADMIN_IDS)
+@dp.message(
+    F.chat.type == "private",
+    lambda m: (m.from_user.id in ADMIN_IDS or m.from_user.id in VIP_ADMIN_IDS) and m.from_user.id in active_admin_chats
+)
 async def handle_admin_chat_messages(message: types.Message):
     admin_id = message.from_user.id
 
     if message.text and message.text.startswith("/"):
         return
 
-    if admin_id in active_admin_chats:
-        ticket_id = active_admin_chats[admin_id]
+    ticket_id = active_admin_chats[admin_id]
 
-        cursor.execute("SELECT user_id, status FROM tickets WHERE id = ?", (ticket_id,))
-        t_row = cursor.fetchone()
+    cursor.execute("SELECT user_id, status FROM tickets WHERE id = ?", (ticket_id,))
+    t_row = cursor.fetchone()
 
-        if not t_row or t_row[1] != 'open':
-            active_admin_chats.pop(admin_id, None)
-            return await message.reply("⚠️ Этот тикет уже закрыт. Вы вышли из режима чата.")
+    if not t_row or t_row[1] != 'open':
+        active_admin_chats.pop(admin_id, None)
+        return await message.reply("⚠️ Этот тикет уже закрыт. Вы вышли из режима чата.")
 
-        target_user_id = t_row[0]
-        admin_mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+    target_user_id = t_row[0]
+    admin_mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
 
-        text_content = message.text or message.caption or ""
-        media_type = "text"
-        file_id = None
+    text_content = message.text or message.caption or ""
+    media_type = "text"
+    file_id = None
 
-        if message.photo:
-            media_type = "photo"
-            file_id = message.photo[-1].file_id
-        elif message.video:
-            media_type = "video"
-            file_id = message.video.file_id
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        file_id = message.video.file_id
 
-        log_ticket_message(ticket_id, "admin", admin_id, admin_mention, text_content, media_type, file_id)
+    log_ticket_message(ticket_id, "admin", admin_id, admin_mention, text_content, media_type, file_id)
 
-        try:
-            await bot.send_message(target_user_id, "💬 <b>Сообщение от администрации:</b>")
-            await bot.copy_message(
-                chat_id=target_user_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id
-            )
-            await message.reply(
-                f"✅ Сообщение доставлено пользователю! (Тикет #{ticket_id})\n"
-                f"<i>Вы все еще в чате. Продолжайте писать или нажмите «🚪 Выйти из чата».</i>"
-            )
-        except Exception as e:
-            await message.reply(f"❌ Ошибка отправки пользователю: {e}")
+    try:
+        await bot.send_message(target_user_id, "💬 <b>Сообщение от администрации:</b>")
+        await bot.copy_message(
+            chat_id=target_user_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
+        await message.reply(
+            f"✅ Сообщение доставлено пользователю! (Тикет #{ticket_id})\n"
+            f"<i>Вы все еще в чате. Продолжайте писать или нажмите «🚪 Выйти из чата».</i>"
+        )
+    except Exception as e:
+        await message.reply(f"❌ Ошибка отправки пользователю: {e}")
 
-        admin_info = f"💬 <b>[Модератор в Тикет #{ticket_id} (Юзер <code>{target_user_id}</code>)]:</b>"
-        for aid in list(set(ADMIN_IDS + VIP_ADMIN_IDS)):
-            if aid != admin_id:
-                try:
-                    head_msg = await bot.send_message(aid, admin_info)
-                    copy_msg = await bot.copy_message(
-                        chat_id=aid,
-                        from_chat_id=message.chat.id,
-                        message_id=message.message_id
-                    )
-                    save_admin_msg_mapping(aid, head_msg.message_id, target_user_id)
-                    save_admin_msg_mapping(aid, copy_msg.message_id, target_user_id)
-                except Exception:
-                    pass
-        return
-
+    admin_info = f"💬 <b>[Модератор в Тикет #{ticket_id} (Юзер <code>{target_user_id}</code>)]:</b>"
+    for aid in list(set(ADMIN_IDS + VIP_ADMIN_IDS)):
+        if aid != admin_id:
+            try:
+                head_msg = await bot.send_message(aid, admin_info)
+                copy_msg = await bot.copy_message(
+                    chat_id=aid,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id
+                )
+                save_admin_msg_mapping(aid, head_msg.message_id, target_user_id)
+                save_admin_msg_mapping(aid, copy_msg.message_id, target_user_id)
+            except Exception:
+                pass
 
 # --- ЗАКРЫТИЕ ТИКЕТА ---
 async def close_ticket_by_id(ticket_id: int, callback: types.CallbackQuery = None, message: types.Message = None):
@@ -828,7 +793,6 @@ async def close_ticket_by_id(ticket_id: int, callback: types.CallbackQuery = Non
     elif message:
         await message.reply(text_msg, reply_markup=builder.as_markup())
 
-
 @dp.callback_query(F.data.startswith("close_ticket_"))
 async def close_ticket_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -836,7 +800,6 @@ async def close_ticket_callback(callback: types.CallbackQuery):
 
     ticket_id = int(callback.data.split("_")[2])
     await close_ticket_by_id(ticket_id, callback=callback)
-
 
 # --- МЕНЮ ОТЛОЖЕННОЙ ПУБЛИКАЦИИ ---
 @dp.callback_query(F.data.startswith("schedmenu_"))
@@ -860,7 +823,6 @@ async def sched_menu_callback(callback: types.CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("backpost_"))
 async def back_post_callback(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -873,7 +835,6 @@ async def back_post_callback(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.edit_reply_markup(reply_markup=get_admin_kb(post_id, user_id, ticket_id))
     await callback.answer()
-
 
 @dp.callback_query(F.data.startswith("customsched_"))
 async def custom_sched_callback(callback: types.CallbackQuery, state: FSMContext):
@@ -895,7 +856,6 @@ async def custom_sched_callback(callback: types.CallbackQuery, state: FSMContext
         reply_markup=builder.as_markup()
     )
     await callback.answer()
-
 
 @dp.message(StateFilter(AdminStates.waiting_for_custom_time))
 async def process_custom_time_input(message: types.Message, state: FSMContext):
@@ -931,9 +891,7 @@ async def process_custom_time_input(message: types.Message, state: FSMContext):
         await message.reply(f"⏰ Пост будет опубликован в {formatted_time}")
 
     except ValueError:
-        await message.reply(
-            "⚠️ Неверный формат времени. Пожалуйста, введите время в формате <b>ЧЧ:ММ</b> (например, <code>06:44</code>):")
-
+        await message.reply("⚠️ Неверный формат времени. Пожалуйста, введите время в формате <b>ЧЧ:ММ</b> (например, <code>06:44</code>):")
 
 @dp.callback_query(F.data.startswith("dosched_"))
 async def do_sched_callback(callback: types.CallbackQuery):
@@ -959,7 +917,6 @@ async def do_sched_callback(callback: types.CallbackQuery):
 
     await callback.message.reply(f"⏰ Пост будет опубликован в {time_str}")
     await callback.answer(f"⏰ Пост будет опубликован в {time_str}")
-
 
 # --- ФОНОВЫЙ ПЛАНИРОВЩИК ---
 async def scheduled_publisher_loop():
@@ -1022,7 +979,6 @@ async def scheduled_publisher_loop():
 
         await asyncio.sleep(30)
 
-
 # --- ОБРАБОТКА АЛЬБОМОВ ---
 async def process_media_group_delayed(mg_id: str):
     await asyncio.sleep(1.5)
@@ -1045,8 +1001,7 @@ async def process_media_group_delayed(mg_id: str):
 
     if active_ticket:
         ticket_id = active_ticket[0]
-        log_ticket_message(ticket_id, "user", user.id, user.full_name, text_content or "[Альбом фотографий]", "album",
-                           None)
+        log_ticket_message(ticket_id, "user", user.id, user.full_name, text_content or "[Альбом фотографий]", "album", None)
 
         all_admins = list(set(ADMIN_IDS + VIP_ADMIN_IDS))
         for admin_id in all_admins:
@@ -1070,16 +1025,14 @@ async def process_media_group_delayed(mg_id: str):
 
     cursor.execute(
         "INSERT INTO posts (user_id, status, text, file_id, media_type, media_group_id) VALUES (?, ?, ?, ?, ?, ?)",
-        (user.id, "pending", text_content,
-         messages[0].photo[-1].file_id if messages[0].photo else messages[0].video.file_id, "album", mg_id)
+        (user.id, "pending", text_content, messages[0].photo[-1].file_id if messages[0].photo else messages[0].video.file_id, "album", mg_id)
     )
     post_id = cursor.lastrowid
 
     for m in messages:
         m_type = "photo" if m.photo else "video"
         f_id = m.photo[-1].file_id if m.photo else m.video.file_id
-        cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)",
-                       (post_id, f_id, m_type))
+        cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)", (post_id, f_id, m_type))
 
     cursor.execute("INSERT INTO tickets (user_id, post_id, status) VALUES (?, ?, 'open')", (user.id, post_id))
     ticket_id = cursor.lastrowid
@@ -1124,7 +1077,6 @@ async def process_media_group_delayed(mg_id: str):
         except Exception as e:
             logging.error(f"Не удалось отправить альбом админу {admin_id}: {e}")
 
-
 # --- ПРИЕМ ПРЕДЛОЖЕНИЙ И СООБЩЕНИЙ ОТ ПОЛЬЗОВАТЕЛЕЙ ---
 @dp.message(F.chat.type == "private")
 async def handle_suggestion(message: types.Message):
@@ -1166,8 +1118,7 @@ async def handle_suggestion(message: types.Message):
             media_type = "video"
             file_id = message.video.file_id
 
-        log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content,
-                           media_type, file_id)
+        log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content, media_type, file_id)
 
         user_info = f"💬 <b>[Тикет #{ticket_id} | Пользователь {message.from_user.full_name}]:</b>"
         all_admins = list(set(ADMIN_IDS + VIP_ADMIN_IDS))
@@ -1221,16 +1172,14 @@ async def handle_suggestion(message: types.Message):
     post_id = cursor.lastrowid
 
     if file_id:
-        cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)",
-                       (post_id, file_id, media_type))
+        cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)", (post_id, file_id, media_type))
 
     cursor.execute("INSERT INTO tickets (user_id, post_id, status) VALUES (?, ?, 'open')",
                    (message.from_user.id, post_id))
     ticket_id = cursor.lastrowid
     conn.commit()
 
-    log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content, media_type,
-                       file_id)
+    log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content, media_type, file_id)
 
     await message.answer(f"🚀 Пост отправлен на модерацию! (Тикет #{ticket_id})")
 
@@ -1275,10 +1224,8 @@ async def handle_suggestion(message: types.Message):
         except Exception as e:
             logging.error(f"Не удалось отправить админу {admin_id}: {e}")
 
-
 # --- ФУНКЦИЯ ПУБЛИКАЦИИ ПОСТА И ЗАКРЫТИЯ ТИКЕТА ---
-async def publish_post_by_id(post_id: int, user_id: int, message: types.Message = None,
-                             callback: types.CallbackQuery = None):
+async def publish_post_by_id(post_id: int, user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
     cursor.execute("SELECT status, text, file_id, media_type FROM posts WHERE id = ?", (post_id,))
     res = cursor.fetchone()
 
@@ -1369,17 +1316,14 @@ async def publish_post_by_id(post_id: int, user_id: int, message: types.Message 
         elif message:
             await message.reply(f"Ошибка при публикации: {e}")
 
-
 @dp.callback_query(F.data.startswith("pub_"))
 async def approve_post(callback: types.CallbackQuery):
     data = callback.data.split("_")
     post_id, user_id = int(data[1]), int(data[2])
     await publish_post_by_id(post_id, user_id, callback=callback)
 
-
 # --- ФУНКЦИЯ И КНОПКА ОТКЛОНЕНИЯ ПОСТА ---
-async def reject_post_by_id(post_id: int, user_id: int, message: types.Message = None,
-                            callback: types.CallbackQuery = None):
+async def reject_post_by_id(post_id: int, user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
     cursor.execute("SELECT status FROM posts WHERE id = ?", (post_id,))
     res = cursor.fetchone()
 
@@ -1427,13 +1371,11 @@ async def reject_post_by_id(post_id: int, user_id: int, message: types.Message =
     elif message:
         await message.reply("❌ Пост отклонен модератором! Тикет закрыт.")
 
-
 @dp.callback_query(F.data.startswith("rej_"))
 async def reject_post(callback: types.CallbackQuery):
     data = callback.data.split("_")
     post_id, user_id = int(data[1]), int(data[2])
     await reject_post_by_id(post_id, user_id, callback=callback)
-
 
 # --- ОБРАБОТКА БЛОКИРОВКИ ПОЛЬЗОВАТЕЛЯ ---
 @dp.callback_query(F.data.startswith("ban_"))
@@ -1474,7 +1416,6 @@ async def ban_user_callback(callback: types.CallbackQuery):
     await callback.message.reply("🚫 Автор поста заблокирован модератором!")
     await callback.answer("🚫 Пользователь успешно забанен!")
 
-
 # --- ОБРАБОТКА КНОПКИ «ОТПРАВИТЬ ЕЩЕ ОДИН ПОСТ» ---
 @dp.callback_query(F.data == "send_more")
 async def send_more_handler(callback: types.CallbackQuery):
@@ -1483,7 +1424,6 @@ async def send_more_handler(callback: types.CallbackQuery):
 
     await callback.message.answer("📝 Жду твой новый пост! Просто отправь его мне (текст, фото или видео).")
     await callback.answer()
-
 
 # --- КОМАНДЫ РАЗБЛОКИРОВКИ И УПРАВЛЕНИЯ БАНАМИ ---
 @dp.message(Command("unban"))
@@ -1515,7 +1455,6 @@ async def unban_user_command(message: types.Message):
     except ValueError:
         await message.answer("⚠️ ID должен состоять только из цифр.")
 
-
 @dp.callback_query(F.data.startswith("unb_"))
 async def unban_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
@@ -1533,7 +1472,6 @@ async def unban_callback(callback: types.CallbackQuery):
 
     await callback.answer("🔓 Пользователь успешно разблокирован!")
     await view_banlist(callback)
-
 
 @dp.callback_query(F.data == "view_banlist")
 async def view_banlist(callback: types.CallbackQuery):
@@ -1562,7 +1500,6 @@ async def view_banlist(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-
 # --- ПАНЕЛЬ /vipadmin И РАССЫЛКА ---
 @dp.message(Command("vipadmin"))
 async def vip_admin_panel(message: types.Message):
@@ -1572,7 +1509,6 @@ async def vip_admin_panel(message: types.Message):
     builder = InlineKeyboardBuilder()
     builder.button(text="📢 Запустить рассылку", callback_data="vip_broadcast_start")
     await message.answer("👑 <b>VIP Панель Управления</b>", reply_markup=builder.as_markup())
-
 
 @dp.callback_query(F.data == "vip_broadcast_start")
 async def start_broadcast(callback: types.CallbackQuery, state: FSMContext):
@@ -1591,13 +1527,11 @@ async def start_broadcast(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-
 @dp.callback_query(F.data == "vip_broadcast_cancel", StateFilter(VipStates.waiting_for_broadcast))
 async def cancel_broadcast(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Рассылка отменена.")
     await callback.answer()
-
 
 @dp.message(StateFilter(VipStates.waiting_for_broadcast))
 async def process_broadcast(message: types.Message, state: FSMContext):
@@ -1622,7 +1556,6 @@ async def process_broadcast(message: types.Message, state: FSMContext):
             pass
 
     await message.answer(f"📢 Рассылка завершена!\n✅ Успешно доставлено: {success_count}/{len(users)}")
-
 
 # --- ИНЛАЙН-КНОПКА "ЧАТ С АВТОРОМ" ---
 @dp.callback_query(F.data.startswith("chat_"))
@@ -1652,7 +1585,6 @@ async def start_chat_callback(callback: types.CallbackQuery):
     )
     await callback.answer("💬 Вход в чат выполнен!")
 
-
 # --- ЗАПУСК ВЕБ-СЕРВЕРА И ПОЛЛИНГА ---
 async def main():
     app = web.Application()
@@ -1668,7 +1600,6 @@ async def main():
 
     logging.info(f"Bot polling started on port {PORT}...")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
