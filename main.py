@@ -7,8 +7,10 @@ import csv
 import html
 import shutil
 import zipfile
+import io
 from pathlib import Path as FilePath
 from openpyxl import Workbook
+from PIL import Image, ImageOps
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -62,6 +64,11 @@ def init_db():
             post_id INTEGER, 
             file_id TEXT, 
             media_type TEXT)''',
+        '''CREATE TABLE IF NOT EXISTS media_hashes
+           (file_id TEXT PRIMARY KEY,
+            media_type TEXT,
+            hash_value TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
         
         '''CREATE TABLE IF NOT EXISTS users
            (user_id INTEGER PRIMARY KEY,
@@ -105,7 +112,25 @@ def init_db():
         '''CREATE TABLE IF NOT EXISTS scheduled_posts 
            (id INTEGER PRIMARY KEY AUTOINCREMENT, 
             post_id INTEGER, 
-            publish_time INTEGER)'''
+            publish_time INTEGER)''',
+        '''CREATE TABLE IF NOT EXISTS channel_messages
+           (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER,
+            message_id INTEGER,
+            post_id INTEGER,
+            file_id TEXT,
+            file_unique_id TEXT,
+            media_type TEXT,
+            media_group_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(channel_id, message_id))''',
+        '''CREATE TABLE IF NOT EXISTS audit_log
+           (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, action TEXT,
+            post_id INTEGER, ticket_id INTEGER, user_id INTEGER, details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        '''CREATE TABLE IF NOT EXISTS search_history
+           (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, post_id INTEGER,
+            method TEXT, query_text TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)'''
     ]
     for table in tables:
         cursor.execute(table)
@@ -120,6 +145,8 @@ def init_db():
         ("users", "avatar_file_id TEXT"),
         ("users", "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
         ("users", "last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ("channel_messages", "file_unique_id TEXT"),
+        ("channel_messages", "media_group_id TEXT"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
@@ -132,6 +159,23 @@ def init_db():
     conn.commit()
 
 init_db()
+
+# Миграция/индексация изображений: хеш хранится отдельно, чтобы поиск по фото
+# работал быстро и не зависел от локальных копий файлов.
+def _ensure_media_hash_schema():
+    try:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_hashes_hash ON media_hashes(hash_value)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_post_media_file ON post_media(file_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_channel_messages_post ON channel_messages(post_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_channel_messages_file ON channel_messages(file_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_channel_messages_unique ON channel_messages(file_unique_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_post ON audit_log(post_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_admin ON search_history(admin_id, id DESC)")
+        conn.commit()
+    except Exception:
+        logging.exception('Не удалось создать индексы media_hashes')
+
+_ensure_media_hash_schema()
 
 bot = Bot(
     token=API_TOKEN,
@@ -157,6 +201,13 @@ class VipStates(StatesGroup):
 class AdminStates(StatesGroup):
     waiting_for_custom_time = State()
     waiting_for_edited_text = State()
+    waiting_for_forwarded_post = State()
+    waiting_for_post_link = State()
+    waiting_for_post_id = State()
+    waiting_for_channel_message_id = State()
+    waiting_for_post_author = State()
+    waiting_for_photo_search = State()
+    waiting_for_post_text = State()
 
 class UserStates(StatesGroup):
     waiting_for_edit_post = State()
@@ -182,8 +233,7 @@ def get_admin_reply_kb(in_chat=False):
         builder.button(text="🚀 Опубликовать пост")
         builder.button(text="❌ Отклонить пост")
         builder.button(text="🚪 Выйти из чата")
-        builder.button(text="🏁 Завершить тикет")
-        builder.adjust(2, 2)
+        builder.adjust(2, 1)
     else:
         builder.button(text="📊 Админ панель")
         builder.button(text="📥 Активные тикеты")
@@ -241,15 +291,87 @@ def get_admin_panel_kb():
     builder.button(text="📁 Архив закрытых тикетов", callback_data="closed_0")
     builder.button(text="📊 Excel пользователей", callback_data="export_excel")
     builder.button(text="💾 Скачать БД", callback_data="export_db")
-    builder.adjust(1, 1, 1, 1, 1, 1, 1)
+    builder.button(text="🔎 Поиск поста", callback_data="post_search_menu")
+    builder.button(text="🕘 Последние поиски", callback_data="recent_searches_0")
+    builder.button(text="📜 Журнал действий", callback_data="audit_0")
+    builder.adjust(1)
     return builder.as_markup()
+
+async def calculate_photo_hash(file_id: str):
+    """Возвращает 128-битный комбинированный dHash+aHash для фото Telegram."""
+    if not file_id:
+        return None
+    try:
+        tgfile = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download_file(tgfile.file_path, destination=buf)
+        buf.seek(0)
+        with Image.open(buf) as im:
+            im = ImageOps.exif_transpose(im).convert('L')
+            # dHash: 8x8 сравнений соседних пикселей
+            d = im.resize((9, 8), Image.Resampling.LANCZOS)
+            dbits = 0
+            for y in range(8):
+                for x in range(8):
+                    dbits = (dbits << 1) | int(d.getpixel((x, y)) > d.getpixel((x + 1, y)))
+            # aHash: средняя яркость 8x8
+            a = im.resize((8, 8), Image.Resampling.LANCZOS)
+            avg = sum(a.getdata()) / 64
+            abits = 0
+            for px in a.getdata():
+                abits = (abits << 1) | int(px >= avg)
+            return f'{dbits:016x}{abits:016x}'
+    except Exception:
+        logging.exception('Не удалось вычислить хеш фото %s', file_id)
+        return None
+
+async def index_photo_file(file_id: str, media_type: str = 'photo'):
+    if not file_id or media_type != 'photo':
+        return None
+    cursor.execute('SELECT hash_value FROM media_hashes WHERE file_id=?', (file_id,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        return row[0]
+    hv = await calculate_photo_hash(file_id)
+    if hv:
+        cursor.execute('INSERT OR REPLACE INTO media_hashes(file_id,media_type,hash_value) VALUES(?,?,?)', (file_id, media_type, hv))
+        conn.commit()
+    return hv
+
+def hash_distance(a: str, b: str) -> int:
+    try:
+        return (int(a, 16) ^ int(b, 16)).bit_count()
+    except Exception:
+        return 999
+
+async def index_all_photos(limit: int = 5000):
+    cursor.execute('''SELECT DISTINCT pm.file_id FROM post_media pm
+                      LEFT JOIN media_hashes mh ON mh.file_id=pm.file_id
+                      WHERE pm.media_type='photo' AND mh.file_id IS NULL
+                      LIMIT ?''', (limit,))
+    files = [r[0] for r in cursor.fetchall() if r[0]]
+    done = 0
+    for fid in files:
+        if await index_photo_file(fid, 'photo'):
+            done += 1
+    return done, len(files)
+
+def cleanup_ticket_statuses():
+    """Убирает зависшие open-текеты, если их пост уже опубликован/отклонён."""
+    cursor.execute('''UPDATE tickets SET status='closed'
+                      WHERE status='open' AND post_id IN
+                      (SELECT id FROM posts WHERE status IN ('published','rejected'))''')
+    changed = cursor.rowcount
+    if changed:
+        conn.commit()
+        logging.info('Закрыто зависших тикетов: %s', changed)
+    return changed
 
 def get_active_chat_kb(ticket_id: int, post_id: int, user_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="🚀 Опубликовать пост", callback_data=f"prepub_{post_id}_{user_id}")
     builder.button(text="❌ Отклонить пост", callback_data=f"rej_{post_id}_{user_id}")
     builder.button(text="🚪 Выйти из чата", callback_data=f"exitchat_{ticket_id}")
-    builder.button(text="🏁 Завершить ТИКЕТ", callback_data=f"close_ticket_{ticket_id}")
     builder.adjust(1, 2, 1)
     return builder.as_markup()
 
@@ -407,12 +529,31 @@ def build_ticket_html(ticket_id:int, media_map=None)->str:
         blocks.append(f"<div class='message {cls}'><div class='meta'><b>{esc(role)}</b> · {esc(sname)} · {esc(ctime)}</div><div>{esc(text).replace(chr(10),'<br>')}</div>{media}</div>")
     return f"<!doctype html><html lang='ru'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Тикет #{tid}</title><style>body{{font-family:Arial;background:#f4f5f7;padding:24px}}.container{{max-width:950px;margin:auto}}.card,.message{{background:#fff;border-radius:14px;padding:18px;margin:12px 0;box-shadow:0 2px 8px #0001}}.user{{background:#eef6ff}}.admin{{background:#f6fef9}}.meta{{color:#667085;font-size:13px;margin-bottom:8px}}img,video{{max-width:100%;border-radius:10px}}</style><div class='container'><div class='card'><h1>💬 Тикет #{tid}</h1><p><b>Пользователь:</b> {esc(name)}<br><b>ID:</b> {uid}<br><b>Статус:</b> {esc(status)}<br><b>Пост:</b> #{pid} ({esc(pstatus)})<br><b>Создан:</b> {esc(created)}</p></div><div class='card'><h2>📝 Исходная заявка</h2>{esc(ptext).replace(chr(10),'<br>')}<br><small>{esc(pmtype)} · {esc(pcreated)}</small></div><div class='card'><h2>📜 История чата ({len(msgs)})</h2>{''.join(blocks) or '<i>Сообщений нет.</i>'}</div></div></html>"
 
+async def build_ticket_html_self_contained(ticket_id: int):
+    """Создаёт HTML, в котором фото встроены base64, поэтому они открываются без Telegram/интернета."""
+    cursor.execute("SELECT sender_type,sender_id,sender_name,text,media_type,file_id,created_at FROM ticket_messages WHERE ticket_id=? ORDER BY id", (ticket_id,))
+    msgs = cursor.fetchall()
+    media_map = {}
+    for idx, row in enumerate(msgs, 1):
+        mtype, file_id = row[4], row[5]
+        if not file_id or mtype != 'photo':
+            continue
+        try:
+            tgfile = await bot.get_file(file_id)
+            buf = io.BytesIO()
+            await bot.download_file(tgfile.file_path, destination=buf)
+            import base64
+            media_map[file_id] = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
+        except Exception:
+            logging.exception('HTML media export failed for ticket %s message %s', ticket_id, idx)
+    return build_ticket_html(ticket_id, media_map)
+
 @dp.callback_query(F.data.startswith('ticket_html_'))
 async def ticket_html_callback(callback:types.CallbackQuery):
     if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
     filename=None
     try:
-        tid=int(callback.data.split('_')[-1]); filename=f'ticket_{tid}_history.html'; open(filename,'w',encoding='utf-8').write(build_ticket_html(tid)); await bot.send_document(callback.from_user.id,FSInputFile(filename),caption=f'📄 Полная HTML-история тикета #{tid}'); await callback.answer('📄 HTML отправлен')
+        tid=int(callback.data.split('_')[-1]); filename=f'ticket_{tid}_history.html'; html_data=await build_ticket_html_self_contained(tid); open(filename,'w',encoding='utf-8').write(html_data); await bot.send_document(callback.from_user.id,FSInputFile(filename),caption=f'📄 Полная HTML-история тикета #{tid} — фото встроены в файл'); await callback.answer('📄 HTML готов')
     except Exception: logging.exception('HTML export error'); await callback.answer('❌ Не удалось сформировать HTML.',show_alert=True)
     finally:
         if filename and os.path.exists(filename): os.remove(filename)
@@ -442,7 +583,7 @@ async def show_user_profile(user_id:int,admin_id:int,callback=None,message=None)
 @dp.callback_query(F.data.startswith('user_profile_'))
 async def user_profile_callback(callback:types.CallbackQuery):
     if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
-    await show_user_profile(int(callback.data.split('_')[-1]),callback.from_user.id,callback=callback)
+    uid=int(callback.data.split('_')[-1]); audit(callback.from_user.id,'open_user_profile',None,None,uid); await show_user_profile(uid,callback.from_user.id,callback=callback)
 
 @dp.message(Command('user'))
 async def user_command(message:types.Message):
@@ -489,7 +630,7 @@ async def user_posts_callback(callback:types.CallbackQuery):
     if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
     parts=callback.data.split('_'); uid=int(parts[2]); page=int(parts[3]); limit=10; offset=page*limit
     cursor.execute("SELECT id,status,media_type,text,created_at FROM posts WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?",(uid,limit,offset)); rows=cursor.fetchall(); kb=InlineKeyboardBuilder(); text=f'📋 <b>Посты пользователя {uid}</b>\n\n'
-    for pid,st,mt,tx,dt in rows: text+=f'#{pid} · {st} · {mt} · {html.escape((tx or "")[:60])} · {dt}\n'
+    for pid,st,mt,tx,dt in rows: text+=f'#{pid} · {st} · {mt} · {html.escape((tx or "")[:60])} · {dt}\n'; kb.button(text=f'📌 Пост #{pid}',callback_data=f'post_card_{pid}')
     if page: kb.button(text='⬅️',callback_data=f'user_posts_{uid}_{page-1}')
     if len(rows)==limit: kb.button(text='➡️',callback_data=f'user_posts_{uid}_{page+1}')
     kb.button(text='👤 Профиль',callback_data=f'user_profile_{uid}'); kb.adjust(2,1)
@@ -519,7 +660,7 @@ def log_ticket_message(ticket_id: int, sender_type: str, sender_id: int, sender_
     conn.commit()
 
 def get_user_open_ticket(user_id: int):
-    cursor.execute("SELECT id, post_id FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1", (user_id,))
+    cursor.execute("SELECT t.id, t.post_id FROM tickets t JOIN posts p ON p.id=t.post_id WHERE t.user_id = ? AND t.status = 'open' AND p.status = 'pending' ORDER BY t.id DESC LIMIT 1", (user_id,))
     return cursor.fetchone()
 
 def build_final_post_text(original_text: str, user_id: int, is_anon: int):
@@ -544,57 +685,375 @@ def build_final_post_text(original_text: str, user_id: int, is_anon: int):
 
     return f"{text_body}{author_tag}{footer}"
 
-# --- ОТОБРАЖЕНИЕ АДМИН-ПАНЕЛИ ---
-async def show_admin_panel(user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
-    if user_id not in ADMIN_IDS and user_id not in VIP_ADMIN_IDS:
-        if callback:
-            return await callback.answer("🔒 У вас нет доступа к этой команде.", show_alert=True)
-        elif message:
-            return await message.answer("🔒 У вас нет доступа к этой команде.")
 
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
+async def register_channel_messages(post_id: int, sent_messages):
+    """Сохраняет связь поста с реальными сообщениями канала."""
+    if not sent_messages:
+        return
+    if not isinstance(sent_messages, (list, tuple)):
+        sent_messages = [sent_messages]
+    for msg in sent_messages:
+        try:
+            mid = getattr(msg, 'message_id', None)
+            if not mid:
+                continue
+            fid = None; unique_id = None; mtype = 'text'; mgid = getattr(msg, 'media_group_id', None)
+            if getattr(msg, 'photo', None):
+                obj = msg.photo[-1]; fid = obj.file_id; unique_id = getattr(obj, 'file_unique_id', None); mtype = 'photo'
+            elif getattr(msg, 'video', None):
+                obj = msg.video; fid = obj.file_id; unique_id = getattr(obj, 'file_unique_id', None); mtype = 'video'
+            cursor.execute("""INSERT OR REPLACE INTO channel_messages
+                              (channel_id,message_id,post_id,file_id,file_unique_id,media_type,media_group_id)
+                              VALUES(?,?,?,?,?,?,?)""",
+                           (CHANNEL_ID, mid, post_id, fid, unique_id, mtype, mgid))
+        except Exception:
+            logging.exception('Не удалось сохранить связь channel message -> post')
+    conn.commit()
 
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'pending'")
-    pending_posts = cursor.fetchone()[0]
+def find_ticket_for_post(post_id: int):
+    cursor.execute("SELECT id FROM tickets WHERE post_id=? ORDER BY id DESC LIMIT 1", (post_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
 
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'scheduled'")
-    scheduled_posts = cursor.fetchone()[0]
+async def find_post_by_forwarded_message(message: types.Message):
+    """Ищет пост по сообщению канала, file_id или визуальному хешу фото."""
+    origin = getattr(message, 'forward_origin', None)
+    channel_id = None; original_message_id = None
+    if origin is not None and getattr(origin, 'type', None) == 'channel':
+        chat = getattr(origin, 'chat', None)
+        channel_id = getattr(chat, 'id', None)
+        original_message_id = getattr(origin, 'message_id', None)
+    if channel_id is None:
+        fchat = getattr(message, 'forward_from_chat', None)
+        channel_id = getattr(fchat, 'id', None)
+        original_message_id = getattr(message, 'forward_from_message_id', None)
+    if channel_id and original_message_id:
+        cursor.execute("SELECT post_id FROM channel_messages WHERE channel_id=? AND message_id=? LIMIT 1", (channel_id, original_message_id))
+        row = cursor.fetchone()
+        if row: return row[0], 'channel_message', 0
+    file_id = None
+    if getattr(message, 'photo', None): file_id = message.photo[-1].file_id
+    elif getattr(message, 'video', None): file_id = message.video.file_id
+    if file_id:
+        cursor.execute("""SELECT DISTINCT post_id FROM post_media WHERE file_id=?
+                          UNION SELECT id FROM posts WHERE file_id=? LIMIT 10""", (file_id, file_id))
+        row = cursor.fetchone()
+        if row: return row[0], 'file_id', 0
+    unique_id = None
+    if getattr(message, 'photo', None): unique_id = getattr(message.photo[-1], 'file_unique_id', None)
+    elif getattr(message, 'video', None): unique_id = getattr(message.video, 'file_unique_id', None)
+    if unique_id:
+        cursor.execute('SELECT post_id FROM channel_messages WHERE file_unique_id=? ORDER BY id DESC LIMIT 1',(unique_id,))
+        row=cursor.fetchone()
+        if row: return row[0], 'file_unique_id', 0
+    if getattr(message, 'photo', None) and file_id:
+        hv = await calculate_photo_hash(file_id)
+        if hv:
+            cursor.execute("SELECT file_id, hash_value FROM media_hashes WHERE media_type='photo'")
+            best=[]
+            for fid, dbhv in cursor.fetchall():
+                d=hash_distance(hv, dbhv)
+                if d <= 18:
+                    cursor.execute("SELECT DISTINCT post_id FROM post_media WHERE file_id=?", (fid,))
+                    best.extend((d,pid) for (pid,) in cursor.fetchall())
+            if best:
+                best.sort(key=lambda x:x[0]); d,pid=best[0]
+                return pid, 'photo_similarity', d
+    return None, None, None
 
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'published'")
-    pub_posts = cursor.fetchone()[0]
+def build_lookup_keyboard(post_id: int, ticket_id, user_id: int):
+    kb=InlineKeyboardBuilder()
+    if ticket_id: kb.button(text=f"🎫 Открыть тикет #{ticket_id}", callback_data=f"open_ticket_{ticket_id}")
+    kb.button(text="👤 Панель пользователя", callback_data=f"user_profile_{user_id}")
+    kb.button(text="📋 Все посты пользователя", callback_data=f"user_posts_{user_id}_0")
+    if ticket_id:
+        kb.button(text="📄 HTML тикета", callback_data=f"ticket_html_{ticket_id}")
+        kb.button(text="📦 ZIP тикета", callback_data=f"ticket_zip_{ticket_id}")
+    kb.button(text="🔎 Искать другой пост", callback_data="post_search_menu")
+    kb.button(text="🔙 Админ панель", callback_data="back_to_admin")
+    kb.adjust(1)
+    return kb.as_markup()
 
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'rejected'")
-    rej_posts = cursor.fetchone()[0]
+def audit(admin_id:int, action:str, post_id=None, ticket_id=None, user_id=None, details=""):
+    try:
+        cursor.execute("INSERT INTO audit_log(admin_id,action,post_id,ticket_id,user_id,details) VALUES(?,?,?,?,?,?)", (admin_id,action,post_id,ticket_id,user_id,details))
+        conn.commit()
+    except Exception: logging.exception("audit log failed")
 
-    cursor.execute("SELECT COUNT(*) FROM banned_users")
-    banned_count = cursor.fetchone()[0]
+def save_search(admin_id:int, post_id:int, method:str, query_text=""):
+    try:
+        cursor.execute("INSERT INTO search_history(admin_id,post_id,method,query_text) VALUES(?,?,?,?)", (admin_id,post_id,method,query_text[:500]))
+        conn.commit()
+    except Exception: logging.exception("search history failed")
 
-    cursor.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'")
-    open_tickets = cursor.fetchone()[0]
+def post_fingerprint(post_id:int):
+    cursor.execute("SELECT p.id,p.media_group_id,p.file_id,cm.message_id,cm.channel_id FROM posts p LEFT JOIN channel_messages cm ON cm.post_id=p.id WHERE p.id=? ORDER BY cm.message_id", (post_id,))
+    return cursor.fetchall()
 
-    stats_text = (
-        f"📊 <b>Панель администратора предложки</b>\n\n"
-        f"👥 Всего пользователей в БД: {total_users}\n"
-        f"📩 Открытых тикетов (чатов): <b>{open_tickets}</b>\n"
-        f"⏳ На модерации: {pending_posts}\n"
-        f"📅 На таймере (отложено): <b>{scheduled_posts}</b>\n"
-        f"✅ Опубликовано всего: {pub_posts}\n"
-        f"❌ Отклонено всего: {rej_posts}\n"
-        f"🚫 В черном списке: {banned_count}\n\n"
-        f"🎛 <b>Все важные действия доступны на кнопках ниже!</b>"
+def get_post_card(post_id:int):
+    cursor.execute("""SELECT p.id,p.user_id,p.status,p.text,p.media_type,p.file_id,p.media_group_id,p.created_at,
+                             u.username,u.first_name,u.last_name,t.id,t.status,p.is_anonymous
+                      FROM posts p LEFT JOIN users u ON u.user_id=p.user_id LEFT JOIN tickets t ON t.post_id=p.id
+                      WHERE p.id=? ORDER BY t.id DESC LIMIT 1""", (post_id,))
+    return cursor.fetchone()
+
+def post_card_text(row):
+    pid,uid,status,text_body,media_type,file_id,mgid,created,un,fn,ln,tid,tstatus,is_anon=row
+    name=f"@{un}" if un and un!='None' else ' '.join(x for x in [fn,ln] if x) or f'ID {uid}'
+    icons={'photo':'📸','video':'🎥','album':'🖼','text':'📝'}
+    channels=post_fingerprint(pid); mids=[str(x[3]) for x in channels if x[3]]
+    return (f"📌 <b>ПОСТ #{pid}</b>\n\n👤 <b>Автор:</b> {html.escape(name)}\n🆔 <b>ID:</b> <code>{uid}</code>\n"
+            f"🎫 <b>Тикет:</b> #{tid or '—'}\n📊 <b>Статус:</b> {html.escape(str(status))}\n"
+            f"📦 <b>Тип:</b> {icons.get(media_type,'📩')} {html.escape(str(media_type or '—'))}\n📅 <b>Создан:</b> {html.escape(str(created or '—'))}\n"
+            f"🔗 <b>Сообщения канала:</b> {', '.join(mids) if mids else '—'}\n" + (f"🌐 <b>Ссылка:</b> {CHANNEL_URL}/{mids[0]}\n" if mids and CHANNEL_URL else '') + f"\n📝 <b>Текст:</b>\n{html.escape(text_body or '—')[:3000]}")
+
+def build_post_card_kb(post_id:int, ticket_id, user_id:int):
+    kb=InlineKeyboardBuilder()
+    if ticket_id: kb.button(text=f"🎫 Открыть тикет #{ticket_id}",callback_data=f"open_ticket_{ticket_id}")
+    kb.button(text="👤 Панель пользователя",callback_data=f"user_profile_{user_id}")
+    kb.button(text="📋 Все посты пользователя",callback_data=f"user_posts_{user_id}_0")
+    if ticket_id:
+        kb.button(text="📄 HTML тикета",callback_data=f"ticket_html_{ticket_id}")
+        kb.button(text="📦 ZIP тикета",callback_data=f"ticket_zip_{ticket_id}")
+    kb.button(text="🔎 Искать другой пост",callback_data="post_search_menu")
+    kb.button(text="🔙 Админ панель",callback_data="back_to_admin")
+    kb.adjust(1)
+    return kb.as_markup()
+
+async def show_lookup_result(message: types.Message, post_id: int, method: str, distance, query_text=""):
+    row=get_post_card(post_id)
+    if not row: return await message.answer('⚠️ Пост найден по индексу, но записи в БД нет.')
+    tid=row[11]; uid=row[1]
+    save_search(message.from_user.id,post_id,method,query_text); audit(message.from_user.id,'search_post',post_id,tid,uid,f'method={method};distance={distance}')
+    text=post_card_text(row)
+    if method=='photo_similarity': text += f"\n\n📐 <b>Совпадение по фото:</b> {max(0,round(100-(distance or 0)*100/128))}%"
+    elif method=='channel_message': text += "\n\n🎯 <b>Найдено по ID сообщения канала.</b>"
+    elif method=='file_id': text += "\n\n🎯 <b>Найдено по Telegram media ID.</b>"
+    elif method=='channel_link': text += "\n\n🎯 <b>Найдено по ссылке на сообщение канала.</b>"
+    elif method=='file_unique_id': text += "\n\n🎯 <b>Найдено по Telegram file_unique_id.</b>"
+    elif method=='post_id': text += "\n\n🎯 <b>Найдено по внутреннему ID поста.</b>"
+    await message.answer(text,reply_markup=build_post_card_kb(post_id,tid,uid))
+    cursor.execute("SELECT file_id,media_type FROM post_media WHERE post_id=? ORDER BY id",(post_id,))
+    for fid,mt in cursor.fetchall()[:10]:
+        try:
+            if mt=='photo': await bot.send_photo(message.chat.id,fid,caption=f'📸 Пост #{post_id}')
+            elif mt=='video': await bot.send_video(message.chat.id,fid,caption=f'🎥 Пост #{post_id}')
+        except Exception: pass
+
+def build_post_search_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📤 Пересланный пост", callback_data="search_mode_forward")
+    kb.button(text="🔗 Ссылка на пост", callback_data="search_mode_link")
+    kb.button(text="🆔 ID поста в боте", callback_data="search_mode_post_id")
+    kb.button(text="📢 ID сообщения канала", callback_data="search_mode_channel_id")
+    kb.button(text="🖼 По фотографии", callback_data="search_mode_photo")
+    kb.button(text="👤 По автору", callback_data="search_mode_author")
+    kb.button(text="📝 По тексту поста", callback_data="search_mode_text")
+    kb.button(text="🔙 Назад в админку", callback_data="back_to_admin")
+    kb.adjust(1)
+    return kb.as_markup()
+
+@dp.callback_query(F.data == 'post_search_menu')
+async def post_search_menu_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer('🔒 Доступ запрещен.', show_alert=True)
+    await state.clear()
+    await callback.message.edit_text(
+        "🔎 <b>ПОИСК ПОСТА</b>\n\nВыберите параметр, по которому искать:\n\n"
+        "📤 Пересланный пост — самый точный способ для опубликованных сообщений.\n"
+        "🔗 Ссылка — если у вас есть ссылка на пост.\n"
+        "🆔 ID поста — внутренний номер поста в боте.\n"
+        "📢 ID сообщения канала — Telegram message ID.\n"
+        "🖼 Фото — резервный поиск по изображению.\n"
+        "👤 Автор — username или Telegram ID.\n"
+        "📝 Текст — поиск по тексту/подписи.",
+        reply_markup=build_post_search_menu()
     )
+    await callback.answer()
 
-    in_chat = user_id in active_admin_chats
-    reply_kb = get_admin_reply_kb(in_chat)
+async def start_search_mode(callback: types.CallbackQuery, state: FSMContext, mode: str, prompt: str):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer('🔒 Доступ запрещен.', show_alert=True)
+    await state.clear()
+    await state.set_state(getattr(AdminStates, mode))
+    kb = InlineKeyboardBuilder()
+    kb.button(text='🔙 Отмена', callback_data='post_search_menu')
+    await callback.message.edit_text(prompt, reply_markup=kb.as_markup())
+    await callback.answer()
 
-    if callback:
-        await callback.message.edit_text(stats_text, reply_markup=get_admin_panel_kb())
-        await callback.message.answer("🎛 Быстрые кнопки управления внизу:", reply_markup=reply_kb)
-        await callback.answer()
-    elif message:
-        await message.answer(stats_text, reply_markup=get_admin_panel_kb())
-        await message.answer("🎛 Быстрые кнопки управления внизу:", reply_markup=reply_kb)
+@dp.callback_query(F.data == 'search_mode_forward')
+async def search_mode_forward(callback: types.CallbackQuery, state: FSMContext):
+    await start_search_mode(callback, state, 'waiting_for_forwarded_post', '📤 <b>Пересланный пост</b>\n\nПерешлите сюда пост из Telegram-канала.')
+
+@dp.callback_query(F.data == 'search_mode_link')
+async def search_mode_link(callback: types.CallbackQuery, state: FSMContext):
+    await start_search_mode(callback, state, 'waiting_for_post_link', '🔗 <b>Ссылка на пост</b>\n\nОтправьте ссылку вида <code>https://t.me/channel/1234</code>.')
+
+@dp.callback_query(F.data == 'search_mode_post_id')
+async def search_mode_post_id(callback: types.CallbackQuery, state: FSMContext):
+    await start_search_mode(callback, state, 'waiting_for_post_id', '🆔 <b>ID поста в боте</b>\n\nОтправьте числовой ID поста, например <code>1842</code>.')
+
+@dp.callback_query(F.data == 'search_mode_channel_id')
+async def search_mode_channel_id(callback: types.CallbackQuery, state: FSMContext):
+    await start_search_mode(callback, state, 'waiting_for_channel_message_id', '📢 <b>ID сообщения канала</b>\n\nОтправьте message ID опубликованного сообщения, например <code>5831</code>.')
+
+@dp.callback_query(F.data == 'search_mode_photo')
+async def search_mode_photo(callback: types.CallbackQuery, state: FSMContext):
+    await start_search_mode(callback, state, 'waiting_for_photo_search', '🖼 <b>Поиск по фотографии</b>\n\nОтправьте фотографию. Это резервный поиск по визуальному сходству.')
+
+@dp.callback_query(F.data == 'search_mode_author')
+async def search_mode_author(callback: types.CallbackQuery, state: FSMContext):
+    await start_search_mode(callback, state, 'waiting_for_post_author', '👤 <b>Поиск по автору</b>\n\nОтправьте @username, username без @ или Telegram ID.')
+
+@dp.callback_query(F.data == 'search_mode_text')
+async def search_mode_text(callback: types.CallbackQuery, state: FSMContext):
+    await start_search_mode(callback, state, 'waiting_for_post_text', '📝 <b>Поиск по тексту</b>\n\nОтправьте слово или фразу из текста/подписи поста.')
+
+@dp.message(StateFilter(AdminStates.waiting_for_post_id))
+async def process_post_id_search(message: types.Message, state: FSMContext):
+    if not is_real_admin(message.from_user.id): return
+    value=(message.text or '').strip(); await state.clear()
+    if not value.isdigit(): return await message.answer('❌ ID должен быть числом.')
+    row=get_post_card(int(value))
+    if not row: return await message.answer('❌ Пост с таким ID не найден.', reply_markup=build_post_search_menu())
+    await show_lookup_result(message, int(value), 'post_id', 0, value)
+
+@dp.message(StateFilter(AdminStates.waiting_for_channel_message_id))
+async def process_channel_message_id_search(message: types.Message, state: FSMContext):
+    if not is_real_admin(message.from_user.id): return
+    value=(message.text or '').strip(); await state.clear()
+    if not value.isdigit(): return await message.answer('❌ Message ID должен быть числом.')
+    cursor.execute('SELECT post_id FROM channel_messages WHERE channel_id=? AND message_id=? LIMIT 1',(CHANNEL_ID,int(value)))
+    row=cursor.fetchone()
+    if not row: return await message.answer('❌ Сообщение канала не найдено в базе.', reply_markup=build_post_search_menu())
+    await show_lookup_result(message,row[0],'channel_message',0,value)
+
+@dp.message(StateFilter(AdminStates.waiting_for_post_author))
+async def process_post_author_search(message: types.Message, state: FSMContext):
+    if not is_real_admin(message.from_user.id): return
+    q=(message.text or '').strip().lstrip('@'); await state.clear()
+    if not q: return await message.answer('❌ Укажите username или ID.')
+    if q.isdigit():
+        cursor.execute('SELECT id FROM posts WHERE user_id=? ORDER BY id DESC LIMIT 30',(int(q),))
+    else:
+        cursor.execute("SELECT p.id FROM posts p JOIN users u ON u.user_id=p.user_id WHERE u.username LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ? ORDER BY p.id DESC LIMIT 30",(f'%{q}%',f'%{q}%',f'%{q}%'))
+    rows=cursor.fetchall()
+    if not rows: return await message.answer('❌ Посты такого автора не найдены.', reply_markup=build_post_search_menu())
+    kb=InlineKeyboardBuilder()
+    for (pid,) in rows:
+        row=get_post_card(pid); kb.button(text=f'📌 Пост #{pid} · {row[2] if row else "?"}',callback_data=f'post_card_{pid}')
+    kb.button(text='🔎 Новый поиск',callback_data='post_search_menu'); kb.adjust(1)
+    await message.answer(f'👤 Найдено постов: <b>{len(rows)}</b>',reply_markup=kb.as_markup())
+
+@dp.message(StateFilter(AdminStates.waiting_for_post_text))
+async def process_post_text_search(message: types.Message, state: FSMContext):
+    if not is_real_admin(message.from_user.id): return
+    q=(message.text or '').strip(); await state.clear()
+    if len(q)<2: return await message.answer('❌ Слишком короткий запрос.')
+    cursor.execute('SELECT id FROM posts WHERE text LIKE ? ORDER BY id DESC LIMIT 30',(f'%{q}%',))
+    rows=cursor.fetchall()
+    if not rows: return await message.answer('❌ Посты с таким текстом не найдены.', reply_markup=build_post_search_menu())
+    kb=InlineKeyboardBuilder()
+    for (pid,) in rows:
+        row=get_post_card(pid); preview=html.escape((row[3] or '')[:45]) if row else ''
+        kb.button(text=f'📌 #{pid} · {preview}',callback_data=f'post_card_{pid}')
+    kb.button(text='🔎 Новый поиск',callback_data='post_search_menu'); kb.adjust(1)
+    await message.answer(f'📝 Найдено постов: <b>{len(rows)}</b>',reply_markup=kb.as_markup())
+
+@dp.message(StateFilter(AdminStates.waiting_for_photo_search))
+async def process_photo_search(message: types.Message, state: FSMContext):
+    if not is_real_admin(message.from_user.id): return
+    await state.clear()
+    if not message.photo: return await message.answer('❌ Отправьте именно фотографию.', reply_markup=build_post_search_menu())
+    fid=message.photo[-1].file_id; hv=await calculate_photo_hash(fid)
+    if not hv: return await message.answer('❌ Не удалось обработать фотографию.')
+    cursor.execute("SELECT file_id,hash_value FROM media_hashes WHERE media_type='photo'")
+    best=[]
+    for dbfid,dbhv in cursor.fetchall():
+        d=hash_distance(hv,dbhv)
+        if d<=18:
+            cursor.execute('SELECT DISTINCT post_id FROM post_media WHERE file_id=?',(dbfid,))
+            best.extend((d,pid) for (pid,) in cursor.fetchall())
+    if not best: return await message.answer('❌ Похожие фотографии не найдены.', reply_markup=build_post_search_menu())
+    best.sort(key=lambda x:x[0]); seen=set(); kb=InlineKeyboardBuilder(); lines=[]
+    for d,pid in best[:15]:
+        if pid in seen: continue
+        seen.add(pid); pct=max(0,round(100-d*100/128)); lines.append(f'📌 #{pid} · совпадение {pct}%')
+        kb.button(text=f'📌 Пост #{pid} · {pct}%',callback_data=f'post_card_{pid}')
+    kb.button(text='🔎 Новый поиск',callback_data='post_search_menu'); kb.adjust(1)
+    await message.answer('🖼 <b>Кандидаты по фотографии</b>\n\n'+'\n'.join(lines),reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == 'find_post_link')
+async def find_post_link_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    await state.set_state(AdminStates.waiting_for_post_link)
+    await callback.message.answer('🔗 <b>Поиск по ссылке</b>\n\nОтправьте ссылку вида <code>https://t.me/channel/1234</code>.')
+    await callback.answer()
+
+@dp.message(StateFilter(AdminStates.waiting_for_post_link))
+async def process_post_link(message: types.Message, state: FSMContext):
+    if not is_real_admin(message.from_user.id): return
+    await state.clear(); import re
+    m=re.search(r'(?:https?://)?t\.me/(?:c/(\d+)/(\d+)|([A-Za-z0-9_]+)/([0-9]+))', message.text or '')
+    if not m: return await message.answer('❌ Не распознал ссылку. Пример: <code>https://t.me/channel/1234</code>')
+    if m.group(1): channel_id=-1000000000000-int(m.group(1)); mid=int(m.group(2))
+    else: channel_id=CHANNEL_ID; mid=int(m.group(4))
+    cursor.execute('SELECT post_id FROM channel_messages WHERE channel_id=? AND message_id=? LIMIT 1',(channel_id,mid)); row=cursor.fetchone()
+    if not row: return await message.answer('❌ Пост по этой ссылке не найден в базе.')
+    await show_lookup_result(message,row[0],'channel_link',0,message.text)
+
+@dp.callback_query(F.data.startswith('audit_'))
+async def audit_callback(callback:types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    page=int(callback.data.split('_')[-1]); limit=15; offset=page*limit
+    cursor.execute("SELECT admin_id,action,post_id,ticket_id,user_id,details,created_at FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?",(limit,offset))
+    rows=cursor.fetchall(); text='📜 <b>Журнал действий</b>\n\n'; kb=InlineKeyboardBuilder()
+    for aid,action,pid,tid,uid,details,dt in rows:
+        text += f'• {dt} · 👮 <code>{aid}</code> · <b>{html.escape(action)}</b> · пост #{pid or "—"} · тикет #{tid or "—"} · user {uid or "—"}\n'
+        if details: text += f'  <i>{html.escape(details[:160])}</i>\n'
+    if page: kb.button(text='⬅️',callback_data=f'audit_{page-1}')
+    if len(rows)==limit: kb.button(text='➡️',callback_data=f'audit_{page+1}')
+    kb.button(text='🔙 Админка',callback_data='back_to_admin'); kb.adjust(2,1)
+    await callback.message.edit_text(text if rows else '📜 Журнал пока пуст.',reply_markup=kb.as_markup()); await callback.answer()
+
+@dp.callback_query(F.data.startswith('recent_searches_'))
+async def recent_searches_callback(callback:types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    page=int(callback.data.split('_')[-1]); limit=10; offset=page*limit
+    cursor.execute('''SELECT s.post_id,s.method,s.created_at,p.status,u.username,u.first_name FROM search_history s
+                      LEFT JOIN posts p ON p.id=s.post_id LEFT JOIN users u ON u.user_id=p.user_id
+                      WHERE s.admin_id=? ORDER BY s.id DESC LIMIT ? OFFSET ?''',(callback.from_user.id,limit,offset))
+    rows=cursor.fetchall(); kb=InlineKeyboardBuilder(); text='🕘 <b>Последние поиски</b>\n\n'
+    for pid,method,dt,st,un,fn in rows:
+        name=f'@{un}' if un and un!='None' else fn or 'без username'; text+=f'• <b>#{pid}</b> · {html.escape(name)} · {html.escape(method)} · {dt}\n'; kb.button(text=f'📌 Пост #{pid}',callback_data=f'post_card_{pid}')
+    if page: kb.button(text='⬅️',callback_data=f'recent_searches_{page-1}')
+    if len(rows)==limit: kb.button(text='➡️',callback_data=f'recent_searches_{page+1}')
+    kb.button(text='🔙 Админка',callback_data='back_to_admin'); kb.adjust(1)
+    await callback.message.edit_text(text if rows else '🕘 История поисков пуста.',reply_markup=kb.as_markup()); await callback.answer()
+
+@dp.callback_query(F.data.startswith('post_card_'))
+async def post_card_callback(callback:types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    pid=int(callback.data.split('_')[-1]); row=get_post_card(pid)
+    if not row: return await callback.answer('Пост не найден.',show_alert=True)
+    await callback.message.edit_text(post_card_text(row),reply_markup=build_post_card_kb(pid,row[11],row[1])); audit(callback.from_user.id,'open_post_card',pid,row[11],row[1]); await callback.answer()
+
+@dp.callback_query(F.data == 'find_forwarded_post')
+async def find_forwarded_post_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer('🔒 Отказано в доступе.', show_alert=True)
+    await state.set_state(AdminStates.waiting_for_forwarded_post)
+    await callback.message.answer('🔎 <b>Поиск автора по пересланному посту</b>\n\nПерешлите сюда пост из Telegram-канала. Я сначала найду точное сообщение канала, затем при необходимости попробую поиск по фотографии.\n\nПосле поиска покажу автора, тикет и панель пользователя.')
+    await callback.answer()
+
+@dp.message(StateFilter(AdminStates.waiting_for_forwarded_post))
+async def process_forwarded_post_lookup(message: types.Message, state: FSMContext):
+    if not is_real_admin(message.from_user.id): return
+    await state.clear()
+    post_id,method,distance=await find_post_by_forwarded_message(message)
+    if not post_id:
+        return await message.answer('❌ <b>Пост не найден.</b>\n\nПерешлите именно опубликованное сообщение из канала или отправьте его фотографию.')
+    await show_lookup_result(message,post_id,method,distance,'forwarded_message')
 
 # --- START & HELP ---
 @dp.message(Command("start"))
@@ -868,10 +1327,6 @@ async def btn_pub_chat(message: types.Message):
 async def btn_rej_chat(message: types.Message):
     await cmd_rej_active_ticket(message)
 
-@dp.message(F.text == "🏁 Завершить тикет")
-async def btn_close_chat(message: types.Message):
-    await cmd_close_active_ticket(message)
-
 # --- ПЕРЕКЛЮЧЕНИЕ АНОНИМНОСТИ В АДМИНКЕ ---
 @dp.callback_query(F.data.startswith("toggleanon_"))
 async def admin_toggle_anon_callback(callback: types.CallbackQuery):
@@ -1035,15 +1490,16 @@ async def confirm_publish_callback(callback: types.CallbackQuery):
                 elif m_type == "video":
                     media_group.append(InputMediaVideo(media=m_file_id, caption=cap))
 
-            await bot.send_media_group(CHANNEL_ID, media=media_group)
+            sent_channel_messages = await bot.send_media_group(CHANNEL_ID, media=media_group)
         else:
             if media_type == "photo":
-                await bot.send_photo(CHANNEL_ID, file_id, caption=final_text)
+                sent_channel_messages = await bot.send_photo(CHANNEL_ID, file_id, caption=final_text)
             elif media_type == "video":
-                await bot.send_video(CHANNEL_ID, file_id, caption=final_text)
+                sent_channel_messages = await bot.send_video(CHANNEL_ID, file_id, caption=final_text)
             else:
-                await bot.send_message(CHANNEL_ID, final_text)
+                sent_channel_messages = await bot.send_message(CHANNEL_ID, final_text)
 
+        await register_channel_messages(post_id, sent_channel_messages)
         cursor.execute("UPDATE posts SET status = 'published' WHERE id = ?", (post_id,))
         cursor.execute("UPDATE tickets SET status = 'closed' WHERE post_id = ?", (post_id,))
         conn.commit()
@@ -1164,18 +1620,6 @@ async def cmd_rej_active_ticket(message: types.Message):
     post_id, user_id = row
     await reject_post_by_id(post_id, user_id, message=message)
 
-@dp.message(Command("close"))
-async def cmd_close_active_ticket(message: types.Message):
-    admin_id = message.from_user.id
-    if admin_id not in ADMIN_IDS and admin_id not in VIP_ADMIN_IDS:
-        return
-
-    if admin_id not in active_admin_chats:
-        return await message.answer("⚠️ Вы не в режиме чата!")
-
-    ticket_id = active_admin_chats[admin_id]
-    await close_ticket_by_id(ticket_id, message=message)
-
 # --- ОТЛОЖЕННЫЕ ПОСТЫ И СПИСКИ ---
 async def list_scheduled_impl(callback: types.CallbackQuery = None, message: types.Message = None):
     cursor.execute('''SELECT s.id, s.post_id, s.publish_time, p.text, p.media_type 
@@ -1287,15 +1731,16 @@ async def pub_now_scheduled_callback(callback: types.CallbackQuery):
                     media_group.append(InputMediaPhoto(media=m_file_id, caption=cap))
                 elif m_type == "video":
                     media_group.append(InputMediaVideo(media=m_file_id, caption=cap))
-            await bot.send_media_group(CHANNEL_ID, media=media_group)
+            sent_channel_messages = await bot.send_media_group(CHANNEL_ID, media=media_group)
         else:
             if media_type == "photo":
-                await bot.send_photo(CHANNEL_ID, file_id, caption=final_text)
+                sent_channel_messages = await bot.send_photo(CHANNEL_ID, file_id, caption=final_text)
             elif media_type == "video":
-                await bot.send_video(CHANNEL_ID, file_id, caption=final_text)
+                sent_channel_messages = await bot.send_video(CHANNEL_ID, file_id, caption=final_text)
             else:
-                await bot.send_message(CHANNEL_ID, final_text)
+                sent_channel_messages = await bot.send_message(CHANNEL_ID, final_text)
 
+        await register_channel_messages(post_id, sent_channel_messages)
         cursor.execute("UPDATE posts SET status = 'published' WHERE id = ?", (post_id,))
         cursor.execute("DELETE FROM scheduled_posts WHERE id = ?", (sched_id,))
         conn.commit()
@@ -1336,6 +1781,7 @@ async def cancel_scheduled_callback(callback: types.CallbackQuery):
 # --- ДЕТАЛЬНАЯ АНАЛИТИКА ---
 @dp.callback_query(F.data == "view_analytics")
 async def view_analytics_callback(callback: types.CallbackQuery):
+    cleanup_ticket_statuses()
     if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
         return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
 
@@ -1379,8 +1825,67 @@ async def view_analytics_callback(callback: types.CallbackQuery):
     await callback.message.edit_text(analytics_text, reply_markup=builder.as_markup())
     await callback.answer()
 
+async def show_admin_panel(user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
+    cleanup_ticket_statuses()
+    if user_id not in ADMIN_IDS and user_id not in VIP_ADMIN_IDS:
+        if callback:
+            return await callback.answer("🔒 У вас нет доступа к этой команде.", show_alert=True)
+        elif message:
+            return await message.answer("🔒 У вас нет доступа к этой команде.")
+
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'pending'")
+    pending_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'scheduled'")
+    scheduled_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'published'")
+    pub_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE status = 'rejected'")
+    rej_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM banned_users")
+    banned_count = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM tickets t JOIN posts p ON p.id=t.post_id WHERE t.status='open' AND p.status='pending'")
+    open_tickets = cursor.fetchone()[0]
+
+    stats_text = (
+        f"📊 <b>Панель администратора предложки</b>\n\n"
+        f"👥 Всего пользователей в БД: {total_users}\n"
+        f"📩 Открытых тикетов (чатов): <b>{open_tickets}</b>\n"
+        f"⏳ На модерации: {pending_posts}\n"
+        f"📅 На таймере (отложено): <b>{scheduled_posts}</b>\n"
+        f"✅ Опубликовано всего: {pub_posts}\n"
+        f"❌ Отклонено всего: {rej_posts}\n"
+        f"🚫 В черном списке: {banned_count}\n\n"
+        f"🎛 <b>Все важные действия доступны на кнопках ниже!</b>"
+    )
+
+    in_chat = user_id in active_admin_chats
+    reply_kb = get_admin_reply_kb(in_chat)
+
+    if callback:
+        await callback.message.edit_text(stats_text, reply_markup=get_admin_panel_kb())
+        await callback.message.answer("🎛 Быстрые кнопки управления внизу:", reply_markup=reply_kb)
+        await callback.answer()
+    elif message:
+        await message.answer(stats_text, reply_markup=get_admin_panel_kb())
+        await message.answer("🎛 Быстрые кнопки управления внизу:", reply_markup=reply_kb)
+
+@dp.callback_query(F.data == "back_to_admin")
+async def back_to_admin_callback(callback: types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer("🔒 Доступ запрещен.", show_alert=True)
+    await show_admin_panel(callback.from_user.id, callback=callback)
+
 # --- АРХИВ ЗАКРЫТЫХ ТИКЕТОВ ---
 async def show_closed(callback: types.CallbackQuery, page: int = 0):
+    cleanup_ticket_statuses()
     if not is_real_admin(callback.from_user.id):
         return await callback.answer("🔒 Доступ запрещен.", show_alert=True)
 
@@ -1440,12 +1945,13 @@ async def closed_callback(callback: types.CallbackQuery):
 
 # --- СПИСОК ТИКЕТОВ ---
 async def list_tickets_impl(callback: types.CallbackQuery = None, message: types.Message = None):
+    cleanup_ticket_statuses()
     cursor.execute('''SELECT t.id, t.user_id, t.post_id, u.username, u.first_name,
                       p.text, p.media_type
                       FROM tickets t
                       LEFT JOIN users u ON t.user_id = u.user_id
                       LEFT JOIN posts p ON t.post_id = p.id
-                      WHERE t.status = 'open'
+                      WHERE t.status = 'open' AND p.status = 'pending'
                       ORDER BY t.id DESC LIMIT 20''')
     tickets = cursor.fetchall()
 
@@ -1489,6 +1995,7 @@ async def open_ticket_callback(callback: types.CallbackQuery):
         return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
 
     ticket_id = int(callback.data.split("_")[2])
+    audit(callback.from_user.id,'open_ticket',None,ticket_id,None)
     await open_ticket_callback_by_id(callback, ticket_id)
 
 async def open_ticket_callback_by_id(callback: types.CallbackQuery, ticket_id: int):
@@ -1528,7 +2035,7 @@ async def open_ticket_callback_by_id(callback: types.CallbackQuery, ticket_id: i
         f"🆔 <b>ID пользователя:</b> <code>{uid}</code>\n"
         f"⚙️ <b>Выбор анонимности:</b> {anon_str}\n"
         f"📝 <b>Заявка:</b> #{pid} (Статус: {p_status})\n"
-        f"📌 <b>Статус тикета:</b> {'🟢 Открыт' if t_status == 'open' else '🔴 Завершен'}"
+        f"📌 <b>Статус тикета:</b> {'🟢 Открыт' if t_status == 'open' else '🔴 Закрыт'}"
         f"{history_str}"
     )
 
@@ -1536,7 +2043,7 @@ async def open_ticket_callback_by_id(callback: types.CallbackQuery, ticket_id: i
     if t_status == 'open':
         builder.button(text="🚀 Опубликовать (Предпросмотр)", callback_data=f"prepub_{pid}_{uid}")
         builder.button(text="💬 Войти в режим чата", callback_data=f"enter_chat_{tid}")
-        builder.button(text="🏁 Завершить ТИКЕТ", callback_data=f"close_ticket_{tid}")
+        builder.button(text="❌ Отклонить пост", callback_data=f"rej_{pid}_{uid}")
 
     builder.button(text="👤 Профиль пользователя", callback_data=f"user_profile_{uid}")
     builder.button(text="📄 Открыть полную историю HTML", callback_data=f"ticket_html_{tid}")
@@ -1621,60 +2128,6 @@ async def handle_admin_chat_messages(message: types.Message):
         await message.reply(f"❌ Ошибка отправки пользователю: {e}")
 
 # --- ЗАКРЫТИЕ ТИКЕТА И ОТКЛОНЕНИЕ ---
-async def close_ticket_by_id(ticket_id: int, callback: types.CallbackQuery = None, message: types.Message = None):
-    cursor.execute("SELECT user_id, post_id FROM tickets WHERE id = ?", (ticket_id,))
-    ticket = cursor.fetchone()
-
-    if not ticket:
-        if callback:
-            await callback.answer("⚠️ Тикет не найден.", show_alert=True)
-        elif message:
-            await message.reply("⚠️ Тикет не найден.")
-        return
-
-    user_id, post_id = ticket
-
-    cursor.execute("UPDATE tickets SET status = 'closed' WHERE id = ?", (ticket_id,))
-    conn.commit()
-
-    for aid, tid in list(active_admin_chats.items()):
-        if tid == ticket_id:
-            active_admin_chats.pop(aid, None)
-
-    try:
-        await bot.send_message(
-            user_id,
-            f"🏁 <b>Ваш Тикет #{ticket_id} был завершен модератором.</b>\n\n"
-            f"Если у вас возникнут новые вопросы или вы захотите прислать еще один пост, отправьте сообщение боту!",
-            reply_markup=get_user_reply_kb(False)
-        )
-    except Exception as e:
-        logging.error(f"Не удалось уведомить пользователя о закрытии тикета: {e}")
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 К списку тикетов", callback_data="list_tickets")
-    builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
-    builder.adjust(1)
-
-    text_msg = (
-        f"🏁 <b>Тикет #{ticket_id} успешно завершен!</b>\n\n"
-        f"Пользователь может продолжать пользоваться предложкой и отправлять новые посты."
-    )
-
-    if callback:
-        await callback.message.edit_text(text_msg, reply_markup=builder.as_markup())
-        await callback.answer("🏁 Тикет завершен!")
-    elif message:
-        await message.reply(text_msg, reply_markup=get_admin_reply_kb(in_chat=False))
-
-@dp.callback_query(F.data.startswith("close_ticket_"))
-async def close_ticket_callback(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS and callback.from_user.id not in VIP_ADMIN_IDS:
-        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
-
-    ticket_id = int(callback.data.split("_")[2])
-    await close_ticket_by_id(ticket_id, callback=callback)
-
 async def reject_post_by_id(post_id: int, user_id: int, message: types.Message = None, callback: types.CallbackQuery = None):
     cursor.execute("SELECT status FROM posts WHERE id = ?", (post_id,))
     res = cursor.fetchone()
@@ -1698,6 +2151,8 @@ async def reject_post_by_id(post_id: int, user_id: int, message: types.Message =
     cursor.execute("UPDATE posts SET status = 'rejected' WHERE id = ?", (post_id,))
     cursor.execute("UPDATE tickets SET status = 'closed' WHERE post_id = ?", (post_id,))
     conn.commit()
+    tid_for_audit=find_ticket_for_post(post_id)
+    audit(callback.from_user.id if callback else (message.from_user.id if message else 0),'reject_post',post_id,tid_for_audit,user_id)
 
     for aid, tid in list(active_admin_chats.items()):
         cursor.execute("SELECT post_id FROM tickets WHERE id = ?", (tid,))
@@ -1882,15 +2337,16 @@ async def scheduled_publisher_loop():
                                 media_group.append(InputMediaPhoto(media=m_file_id, caption=cap))
                             elif m_type == "video":
                                 media_group.append(InputMediaVideo(media=m_file_id, caption=cap))
-                        await bot.send_media_group(CHANNEL_ID, media=media_group)
+                        sent_channel_messages = await bot.send_media_group(CHANNEL_ID, media=media_group)
                     else:
                         if media_type == "photo":
-                            await bot.send_photo(CHANNEL_ID, file_id, caption=final_text)
+                            sent_channel_messages = await bot.send_photo(CHANNEL_ID, file_id, caption=final_text)
                         elif media_type == "video":
-                            await bot.send_video(CHANNEL_ID, file_id, caption=final_text)
+                            sent_channel_messages = await bot.send_video(CHANNEL_ID, file_id, caption=final_text)
                         else:
-                            await bot.send_message(CHANNEL_ID, final_text)
+                            sent_channel_messages = await bot.send_message(CHANNEL_ID, final_text)
 
+                    await register_channel_messages(post_id, sent_channel_messages)
                     cursor.execute("UPDATE posts SET status = 'published' WHERE id = ?", (post_id,))
                     cursor.execute("DELETE FROM scheduled_posts WHERE id = ?", (sched_id,))
                     conn.commit()
@@ -1965,6 +2421,8 @@ async def process_media_group_delayed(mg_id: str):
         m_type = "photo" if m.photo else "video"
         f_id = m.photo[-1].file_id if m.photo else m.video.file_id
         cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)", (post_id, f_id, m_type))
+        if m_type == 'photo':
+            await index_photo_file(f_id, 'photo')
 
     cursor.execute("INSERT INTO tickets (user_id, post_id, status) VALUES (?, ?, 'open')", (user.id, post_id))
     ticket_id = cursor.lastrowid
@@ -2018,6 +2476,93 @@ async def process_media_group_delayed(mg_id: str):
 
         except Exception as e:
             logging.error(f"Не удалось отправить альбом админу {admin_id}: {e}")
+
+# --- ПОИСК ПО ФОТО ---
+@dp.message(F.chat.type == 'private', F.photo)
+async def admin_photo_search(message: types.Message):
+    admin_id = message.from_user.id
+    if not is_real_admin(admin_id) or admin_id in active_admin_chats:
+        return
+    query_file_id = message.photo[-1].file_id
+    query_hash = await index_photo_file(query_file_id, 'photo')
+    if not query_hash:
+        return await message.answer('❌ Не удалось обработать изображение для поиска.')
+
+    # Если это старые данные до появления индекса, автоматически достраиваем индекс.
+    cursor.execute("SELECT COUNT(*) FROM post_media pm LEFT JOIN media_hashes mh ON mh.file_id=pm.file_id WHERE pm.media_type='photo' AND mh.file_id IS NULL")
+    missing_index = cursor.fetchone()[0]
+    if missing_index:
+        await index_all_photos(min(5000, missing_index))
+
+    # Сначала точное совпадение Telegram file_id, затем похожие изображения по хешу.
+    cursor.execute('''SELECT DISTINCT p.id,t.id,p.user_id,p.status,p.text,pm.file_id
+                      FROM post_media pm
+                      JOIN posts p ON p.id=pm.post_id
+                      LEFT JOIN tickets t ON t.post_id=p.id
+                      WHERE pm.media_type='photo' AND pm.file_id=?
+                      ORDER BY p.id DESC LIMIT 10''', (query_file_id,))
+    exact = cursor.fetchall()
+
+    cursor.execute('''SELECT pm.file_id,mh.hash_value,p.id,t.id,p.user_id,p.status,p.text
+                      FROM media_hashes mh
+                      JOIN post_media pm ON pm.file_id=mh.file_id AND pm.media_type='photo'
+                      JOIN posts p ON p.id=pm.post_id
+                      LEFT JOIN tickets t ON t.post_id=p.id
+                      WHERE mh.hash_value IS NOT NULL''')
+    candidates=[]
+    for fid,hv,pid,tid,uid,pstatus,ptext in cursor.fetchall():
+        dist=hash_distance(query_hash,hv)
+        if dist <= 20:
+            candidates.append((dist,pid,tid,uid,pstatus,ptext,fid))
+    candidates.sort(key=lambda x:(x[0],-x[1]))
+
+    seen=set(); matches=[]
+    for row in exact:
+        key=row[0]
+        if key not in seen:
+            seen.add(key); matches.append((0,)+row)
+    for row in candidates:
+        key=row[1]
+        if key not in seen:
+            seen.add(key); matches.append(row)
+        if len(matches)>=10: break
+
+    if not matches:
+        return await message.answer('🔎 <b>Совпадений не найдено.</b>\n\nПопробуй отправить оригинал фото или более полный фрагмент изображения.')
+
+    text='🔎 <b>Результаты поиска по фото</b>\n\n'
+    for idx,row in enumerate(matches[:10],1):
+        if row[0]==0:
+            _,pid,tid,uid,pstatus,ptext,fid=row
+            distance='точное совпадение'
+        else:
+            distance,pid,tid,uid,pstatus,ptext,fid=row
+            distance=f'похожесть: {max(0,100-distance*3)}%'
+        cursor.execute('SELECT username,first_name,last_name FROM users WHERE user_id=?',(uid,))
+        u=cursor.fetchone() or (None,None,None)
+        uname=('@'+u[0]) if u[0] and u[0] != 'None' else ' '.join(x for x in [u[1],u[2]] if x) or f'ID {uid}'
+        text += f'<b>{idx}. Пост #{pid}</b> · Тикет #{tid or "—"} · {distance}\n👤 {html.escape(uname)} · ID <code>{uid}</code>\n📌 Статус: {html.escape(str(pstatus))}\n'
+        if ptext: text += f'📝 {html.escape(ptext[:100])}\n'
+        text += '\n'
+    await message.answer(text)
+    # Отправляем найденные фотографии, чтобы модератор сразу визуально сопоставил источник.
+    for row in matches[:10]:
+        if row[0]==0:
+            _,pid,tid,uid,pstatus,ptext,fid=row
+        else:
+            _,pid,tid,uid,pstatus,ptext,fid=row
+        caption=f'📸 Пост #{pid} | Тикет #{tid or "—"} | ID автора: {uid}\nСтатус: {pstatus}'
+        try:
+            await bot.send_photo(admin_id, fid, caption=caption)
+        except Exception:
+            pass
+
+@dp.message(Command('indexphotos'))
+async def cmd_index_photos(message: types.Message):
+    if not is_real_admin(message.from_user.id): return
+    await message.answer('🔄 Индексирую фотографии. Это может занять время...')
+    done,total=await index_all_photos()
+    await message.answer(f'✅ Индексация завершена: обработано {done} из {total} новых фото.')
 
 # --- ПРИЕМ ПРЕДЛОЖЕНИЙ И СООБЩЕНИЙ ОТ ПОЛЬЗОВАТЕЛЕЙ ---
 @dp.message(F.chat.type == "private")
@@ -2113,6 +2658,8 @@ async def handle_suggestion(message: types.Message):
 
     if file_id:
         cursor.execute("INSERT INTO post_media (post_id, file_id, media_type) VALUES (?, ?, ?)", (post_id, file_id, media_type))
+        if media_type == 'photo':
+            await index_photo_file(file_id, 'photo')
 
     cursor.execute("INSERT INTO tickets (user_id, post_id, status) VALUES (?, ?, 'open')",
                    (message.from_user.id, post_id))
