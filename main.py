@@ -3,6 +3,7 @@ import time
 import asyncio
 import sqlite3
 import logging
+import csv
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -10,7 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from aiogram.types import LinkPreviewOptions, InputMediaPhoto, InputMediaVideo
+from aiogram.types import LinkPreviewOptions, InputMediaPhoto, InputMediaVideo, FSInputFile
 from aiohttp import web
 
 # --- НАСТРОЙКИ ---
@@ -33,7 +34,8 @@ DELETE_CONTACT = "@Triumfal"
 logging.basicConfig(level=logging.INFO)
 
 # --- БАЗА ДАННЫХ ---
-conn = sqlite3.connect('suggestions.db', check_same_thread=False)
+DB_PATH = 'suggestions.db'
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
 def init_db():
@@ -55,9 +57,16 @@ def init_db():
             file_id TEXT, 
             media_type TEXT)''',
         
-        '''CREATE TABLE IF NOT EXISTS users 
-           (user_id INTEGER PRIMARY KEY, 
-            username TEXT)''',
+        '''CREATE TABLE IF NOT EXISTS users
+           (user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            language_code TEXT,
+            is_premium INTEGER DEFAULT 0,
+            avatar_file_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
         
         '''CREATE TABLE IF NOT EXISTS banned_users 
            (user_id INTEGER PRIMARY KEY, 
@@ -95,11 +104,21 @@ def init_db():
     for table in tables:
         cursor.execute(table)
     
-    # Миграция БД для добавления is_anonymous, если таблица существовала ранее
-    try:
-        cursor.execute("ALTER TABLE posts ADD COLUMN is_anonymous INTEGER DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass
+    # Безопасная миграция старых БД: существующие данные не удаляются.
+    for table, column in [
+        ("posts", "is_anonymous INTEGER DEFAULT 1"),
+        ("users", "first_name TEXT"),
+        ("users", "last_name TEXT"),
+        ("users", "language_code TEXT"),
+        ("users", "is_premium INTEGER DEFAULT 0"),
+        ("users", "avatar_file_id TEXT"),
+        ("users", "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ("users", "last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass
 
     conn.commit()
 
@@ -116,6 +135,8 @@ dp = Dispatcher()
 
 media_group_buffers = {}
 active_admin_chats = {}
+# Админ может временно работать как обычный пользователь.
+admin_in_user_mode = set()
 
 async def web_handler(request):
     return web.Response(text="Bot is running!")
@@ -208,7 +229,10 @@ def get_admin_panel_kb():
     builder.button(text="📅 Отложенные посты", callback_data="list_scheduled")
     builder.button(text="📊 Детальная аналитика", callback_data="view_analytics")
     builder.button(text="📋 Список банов", callback_data="view_banlist")
-    builder.adjust(1, 1, 1, 1)
+    builder.button(text="📁 Архив закрытых тикетов", callback_data="closed_0")
+    builder.button(text="📊 Excel пользователей", callback_data="export_excel")
+    builder.button(text="💾 Скачать БД", callback_data="export_db")
+    builder.adjust(1, 1, 1, 1, 1, 1, 1)
     return builder.as_markup()
 
 def get_active_chat_kb(ticket_id: int, post_id: int, user_id: int):
@@ -225,10 +249,102 @@ def is_banned(user_id: int) -> bool:
     cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
     return cursor.fetchone() is not None
 
+def is_real_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or user_id in VIP_ADMIN_IDS
+
+
+def is_admin_active(user_id: int) -> bool:
+    return is_real_admin(user_id) and user_id not in admin_in_user_mode
+
+
+def get_ticket_label(username, first_name, media_type, text, ticket_id):
+    name = f"@{username}" if username and username != "None" else (first_name or "Пользователь")
+    icons = {"photo": "📸", "video": "🎥", "album": "🖼", "text": "📝"}
+    icon = icons.get(media_type, "📩")
+    preview = (text or "").replace("\n", " ").strip()
+    preview = f" «{preview[:18]}…»" if preview else ""
+    return f"{name} • {icon}{preview} [#{ticket_id}]"
+
+
+async def update_avatar(user_id: int):
+    try:
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if photos.total_count:
+            file_id = photos.photos[0][-1].file_id
+            cursor.execute("UPDATE users SET avatar_file_id=? WHERE user_id=?", (file_id, user_id))
+            conn.commit()
+    except Exception as e:
+        logging.debug("avatar %s: %s", user_id, e)
+
+
 def register_user(user: types.User):
-    cursor.execute("INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)",
-                   (user.id, user.username or "None"))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user.id,))
+    if cursor.fetchone():
+        cursor.execute(
+            '''UPDATE users SET username=?, first_name=?, last_name=?,
+               language_code=?, is_premium=?, last_active=?
+               WHERE user_id=?''',
+            (user.username or "None", user.first_name or "",
+             user.last_name or "", user.language_code or "unknown",
+             int(bool(user.is_premium)), now, user.id)
+        )
+    else:
+        cursor.execute(
+            '''INSERT INTO users
+               (user_id, username, first_name, last_name, language_code,
+                is_premium, created_at, last_active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (user.id, user.username or "None", user.first_name or "",
+             user.last_name or "", user.language_code or "unknown",
+             int(bool(user.is_premium)), now, now)
+        )
     conn.commit()
+    asyncio.create_task(update_avatar(user.id))
+
+
+async def export_excel(admin_id: int):
+    if not is_real_admin(admin_id):
+        return
+    filename = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    cursor.execute('''SELECT user_id, username, first_name, last_name,
+                      language_code, is_premium, avatar_file_id,
+                      created_at, last_active FROM users ORDER BY user_id''')
+    rows = cursor.fetchall()
+    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(["ID", "Username", "Имя", "Фамилия", "Язык",
+                         "Premium", "Avatar file_id", "Регистрация", "Активность"])
+        writer.writerows(rows)
+    try:
+        await bot.send_document(
+            admin_id, FSInputFile(filename),
+            caption=f"📊 Пользователей выгружено: {len(rows)}"
+        )
+    finally:
+        if os.path.exists(filename):
+            os.remove(filename)
+
+
+async def export_db(admin_id: int):
+    if not is_real_admin(admin_id):
+        return
+    backup_name = f"suggestions_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    backup_conn = None
+    try:
+        # SQLite backup безопаснее, чем отправка файла БД прямо во время записи.
+        backup_conn = sqlite3.connect(backup_name)
+        with backup_conn:
+            conn.backup(backup_conn)
+        await bot.send_document(
+            admin_id, FSInputFile(backup_name),
+            caption="💾 Полная резервная копия SQLite-базы"
+        )
+    finally:
+        if backup_conn:
+            backup_conn.close()
+        if os.path.exists(backup_name):
+            os.remove(backup_name)
 
 def save_admin_msg_mapping(admin_id: int, admin_msg_id: int, user_id: int):
     cursor.execute("INSERT OR REPLACE INTO admin_messages (admin_id, admin_msg_id, user_id) VALUES (?, ?, ?)",
@@ -328,8 +444,8 @@ async def start(message: types.Message):
 
     register_user(message.from_user)
     
-    is_admin = message.from_user.id in ADMIN_IDS or message.from_user.id in VIP_ADMIN_IDS
-    if is_admin:
+    is_admin = is_real_admin(message.from_user.id)
+    if is_admin and is_admin_active(message.from_user.id):
         await show_admin_panel(message.from_user.id, message=message)
         return
 
@@ -380,6 +496,11 @@ async def user_anon_toggle_callback(callback: types.CallbackQuery):
     data = callback.data.split("_")
     action = data[2] # "on" or "off"
     post_id = int(data[3])
+
+    cursor.execute("SELECT user_id FROM posts WHERE id = ?", (post_id,))
+    owner = cursor.fetchone()
+    if not owner or owner[0] != callback.from_user.id:
+        return await callback.answer("🔒 Это не ваш пост.", show_alert=True)
 
     new_anon = 1 if action == "on" else 0
     cursor.execute("UPDATE posts SET is_anonymous = ? WHERE id = ?", (new_anon, post_id))
@@ -476,13 +597,18 @@ async def process_post_edit(message: types.Message, state: FSMContext):
 
     user_link = f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.full_name}</a>"
     username = f" (@{message.from_user.username})" if message.from_user.username else ""
+    ticket_label = get_ticket_label(
+        message.from_user.username, message.from_user.first_name,
+        media_type, text_content, ticket_id
+    )
 
     admin_caption = (
-        f"✏️ <b>АВТОР ИЗМЕНИЛ ПОСТ В ТИКЕТЕ #{ticket_id}!</b>\n\n"
+        f"✏️ <b>АВТОР ИЗМЕНИЛ ПОСТ В ТИКЕТЕ</b>\n"
+        f"🏷 <b>{ticket_label}</b>\n\n"
         f"{text_content}\n\n"
         f"👤 <b>Автор:</b> {user_link}{username}\n"
         f"🆔 ID: <code>{message.from_user.id}</code>\n"
-        f"💬 <b>Тикет #{ticket_id}</b> | 📝 <b>Заявка #{post_id}</b>"
+        f"🏷 <b>Тикет:</b> {ticket_label} | 📝 <b>Заявка #{post_id}</b>"
     )
 
     all_admins = list(set(ADMIN_IDS + VIP_ADMIN_IDS))
@@ -499,6 +625,37 @@ async def process_post_edit(message: types.Message, state: FSMContext):
                 save_admin_msg_mapping(admin_id, sent_msg.message_id, message.from_user.id)
         except Exception as e:
             logging.error(f"Ошибка уведомления админа {admin_id}: {e}")
+
+# --- ЗАЩИЩЕННЫЕ АДМИН-КОМАНДЫ И РЕЖИМЫ ---
+@dp.message(Command("admin", "stats", "usermode", "adminmode", "getdb", "excel"))
+async def protected_commands(message: types.Message, state: FSMContext):
+    if not is_real_admin(message.from_user.id):
+        # Не раскрываем посторонним существование админских функций.
+        return
+    await state.clear()
+    command = message.text.split()[0].split("@")[0].lower()
+
+    if command == "/usermode":
+        admin_in_user_mode.add(message.from_user.id)
+        active_admin_chats.pop(message.from_user.id, None)
+        return await message.answer(
+            "👤 <b>Режим пользователя включен.</b>\n"
+            "Теперь вы можете пользоваться предложкой как обычный пользователь.",
+            reply_markup=get_user_reply_kb(get_user_open_ticket(message.from_user.id) is not None)
+        )
+
+    if command in ("/admin", "/stats", "/adminmode"):
+        admin_in_user_mode.discard(message.from_user.id)
+        if command == "/adminmode":
+            await message.answer("🛡 <b>Режим администратора включен.</b>")
+        return await show_admin_panel(message.from_user.id, message=message)
+
+    if command == "/getdb":
+        return await export_db(message.from_user.id)
+
+    if command == "/excel":
+        return await export_excel(message.from_user.id)
+
 
 # --- КНОПКИ АДМИНА ВНИЗУ ЧАТА ---
 @dp.message(F.text == "📊 Админ панель")
@@ -639,6 +796,8 @@ async def prepub_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("cancelprepub_"))
 async def cancel_prepub_callback(callback: types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
     await callback.message.edit_text("❌ Предпросмотр публикации отменен.")
     await callback.answer("Отменено")
 
@@ -1060,13 +1219,73 @@ async def view_analytics_callback(callback: types.CallbackQuery):
     await callback.message.edit_text(analytics_text, reply_markup=builder.as_markup())
     await callback.answer()
 
+# --- АРХИВ ЗАКРЫТЫХ ТИКЕТОВ ---
+async def show_closed(callback: types.CallbackQuery, page: int = 0):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer("🔒 Доступ запрещен.", show_alert=True)
+
+    limit = 10
+    offset = max(page, 0) * limit
+    cursor.execute('''SELECT t.id, u.username, u.first_name, p.media_type, p.text,
+                      p.status
+                      FROM tickets t
+                      LEFT JOIN users u ON u.user_id=t.user_id
+                      LEFT JOIN posts p ON p.id=t.post_id
+                      WHERE t.status='closed'
+                      ORDER BY t.id DESC LIMIT ? OFFSET ?''', (limit, offset))
+    rows = cursor.fetchall()
+
+    builder = InlineKeyboardBuilder()
+    text = "📁 <b>Архив закрытых тикетов</b>\n\n"
+
+    for tid, username, first_name, media_type, post_text, post_status in rows:
+        label = get_ticket_label(username, first_name, media_type, post_text, tid)
+        icon = "✅" if post_status == "published" else "❌" if post_status == "rejected" else "🏁"
+        text += f"{icon} {label}\n"
+        builder.button(text=f"{icon} {label}", callback_data=f"open_ticket_{tid}")
+
+    if page:
+        builder.button(text="⬅️ Назад", callback_data=f"closed_{page-1}")
+    if len(rows) == limit:
+        builder.button(text="Вперед ➡️", callback_data=f"closed_{page+1}")
+    builder.button(text="🔙 В админку", callback_data="back_to_admin")
+    builder.adjust(1)
+
+    await callback.message.edit_text(text if rows else "📁 <b>Архив пуст.</b>",
+                                      reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_({"export_excel", "export_db"}))
+async def protected_exports(callback: types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer("🔒 Доступ запрещен.", show_alert=True)
+    if callback.data == "export_excel":
+        await export_excel(callback.from_user.id)
+    else:
+        await export_db(callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("closed_"))
+async def closed_callback(callback: types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer("🔒 Доступ запрещен.", show_alert=True)
+    try:
+        page = int(callback.data.split("_")[1])
+    except (ValueError, IndexError):
+        return await callback.answer("⚠️ Некорректная страница.", show_alert=True)
+    await show_closed(callback, page)
+
+
 # --- СПИСОК ТИКЕТОВ ---
 async def list_tickets_impl(callback: types.CallbackQuery = None, message: types.Message = None):
-    cursor.execute('''SELECT t.id, t.user_id, t.post_id, u.username, p.text 
-                      FROM tickets t 
-                      LEFT JOIN users u ON t.user_id = u.user_id 
-                      LEFT JOIN posts p ON t.post_id = p.id 
-                      WHERE t.status = 'open' 
+    cursor.execute('''SELECT t.id, t.user_id, t.post_id, u.username, u.first_name,
+                      p.text, p.media_type
+                      FROM tickets t
+                      LEFT JOIN users u ON t.user_id = u.user_id
+                      LEFT JOIN posts p ON t.post_id = p.id
+                      WHERE t.status = 'open'
                       ORDER BY t.id DESC LIMIT 20''')
     tickets = cursor.fetchall()
 
@@ -1083,11 +1302,10 @@ async def list_tickets_impl(callback: types.CallbackQuery = None, message: types
 
     text = "💬 <b>Список активных диалогов (Тикетов):</b>\n\n"
 
-    for tid, uid, pid, uname, ptext in tickets:
-        user_disp = f"@{uname}" if uname and uname != "None" else f"ID {uid}"
-        preview = (ptext[:25] + "...") if ptext else "Медиафайл / Альбом"
-        text += f"• <b>Тикет #{tid}</b> | {user_disp} (Заявка #{pid})\n   └ <i>{preview}</i>\n\n"
-        builder.button(text=f"💬 {user_disp} (Тикет #{tid})", callback_data=f"open_ticket_{tid}")
+    for tid, uid, pid, uname, first_name, ptext, media_type in tickets:
+        label = get_ticket_label(uname, first_name, media_type, ptext, tid)
+        text += f"• {label} (Заявка #{pid})\n\n"
+        builder.button(text=f"💬 {label}", callback_data=f"open_ticket_{tid}")
 
     builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
     builder.adjust(1)
@@ -1344,6 +1562,8 @@ async def reject_post_by_id(post_id: int, user_id: int, message: types.Message =
 
 @dp.callback_query(F.data.startswith("rej_"))
 async def reject_post(callback: types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
     data = callback.data.split("_")
     post_id, user_id = int(data[1]), int(data[2])
     await reject_post_by_id(post_id, user_id, callback=callback)
@@ -1372,6 +1592,8 @@ async def sched_menu_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("backpost_"))
 async def back_post_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
     await state.clear()
     data = callback.data.split("_")
     post_id, user_id = data[1], data[2]
@@ -1446,6 +1668,8 @@ async def process_custom_time_input(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("dosched_"))
 async def do_sched_callback(callback: types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id):
+        return await callback.answer("🔒 Отказано в доступе.", show_alert=True)
     data = callback.data.split("_")
     post_id, user_id, seconds = int(data[1]), int(data[2]), int(data[3])
 
@@ -1584,9 +1808,14 @@ async def process_media_group_delayed(mg_id: str):
     conn.commit()
 
     log_ticket_message(ticket_id, "user", user.id, user.full_name, text_content or "[Альбом фотографий]", "album", None)
+    ticket_label = get_ticket_label(
+        user.username, user.first_name, "album",
+        text_content or "[Альбом фотографий]", ticket_id
+    )
 
     await first_msg.answer(
-        f"🚀 <b>Альбом отправлен на модерацию! (Тикет #{ticket_id})</b>\n\n"
+        f"🚀 <b>Альбом отправлен на модерацию!</b>\n"
+        f"🏷 <b>{ticket_label}</b>\n\n"
         f"Вы можете настроить отображение вашего @username кнопкой «👤 Настройка анонимности» в меню ниже.",
         reply_markup=get_user_reply_kb(True)
     )
@@ -1600,7 +1829,7 @@ async def process_media_group_delayed(mg_id: str):
         f"👤 <b>Автор:</b> {user_link}{username}\n"
         f"⚙️ Выбор автора: 🔒 Анонимно\n"
         f"🆔 ID: <code>{user.id}</code>\n"
-        f"💬 <b>Тикет #{ticket_id}</b> | 📝 <b>Заявка #{post_id}</b>"
+        f"🏷 <b>Тикет:</b> {ticket_label} | 📝 <b>Заявка #{post_id}</b>"
     )
 
     all_admins = list(set(ADMIN_IDS + VIP_ADMIN_IDS))
@@ -1728,9 +1957,14 @@ async def handle_suggestion(message: types.Message):
     conn.commit()
 
     log_ticket_message(ticket_id, "user", message.from_user.id, message.from_user.full_name, text_content, media_type, file_id)
+    ticket_label = get_ticket_label(
+        message.from_user.username, message.from_user.first_name,
+        media_type, text_content, ticket_id
+    )
 
     await message.answer(
-        f"🚀 <b>Пост отправлен на модерацию! (Тикет #{ticket_id})</b>\n\n"
+        f"🚀 <b>Пост отправлен на модерацию!</b>\n"
+        f"🏷 <b>{ticket_label}</b>\n\n"
         f"Вы можете настроить отображение вашего @username кнопкой «👤 Настройка анонимности» в меню ниже.",
         reply_markup=get_user_reply_kb(True)
     )
@@ -1743,7 +1977,7 @@ async def handle_suggestion(message: types.Message):
         f"👤 <b>Автор:</b> {user_link}{username}\n"
         f"⚙️ Выбор автора: 🔒 Анонимно (по умолчанию)\n"
         f"🆔 ID: <code>{message.from_user.id}</code>\n"
-        f"💬 <b>Тикет #{ticket_id}</b> | 📝 <b>Заявка #{post_id}</b>"
+        f"🏷 <b>Тикет:</b> {ticket_label} | 📝 <b>Заявка #{post_id}</b>"
     )
 
     all_admins = list(set(ADMIN_IDS + VIP_ADMIN_IDS))
