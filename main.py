@@ -4,6 +4,11 @@ import asyncio
 import sqlite3
 import logging
 import csv
+import html
+import shutil
+import zipfile
+from pathlib import Path as FilePath
+from openpyxl import Workbook
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -34,7 +39,8 @@ DELETE_CONTACT = "@Triumfal"
 logging.basicConfig(level=logging.INFO)
 
 # --- БАЗА ДАННЫХ ---
-DB_PATH = 'suggestions.db'
+DB_PATH = os.getenv('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'suggestions.db'))
+logging.info('SQLite database: %s', DB_PATH)
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
@@ -120,6 +126,9 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Восстанавливаем пользователей из старых данных, если users пустая.
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, username) SELECT DISTINCT user_id, 'None' FROM posts WHERE user_id IS NOT NULL")
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, username) SELECT DISTINCT user_id, 'None' FROM tickets WHERE user_id IS NOT NULL")
     conn.commit()
 
 init_db()
@@ -303,48 +312,199 @@ def register_user(user: types.User):
     asyncio.create_task(update_avatar(user.id))
 
 
+def sync_users_from_legacy_tables():
+    cursor.execute("INSERT OR IGNORE INTO users(user_id,username,first_name,last_name,created_at,last_active) SELECT DISTINCT user_id, COALESCE(NULLIF(username,''), 'None'), '', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM banned_users WHERE user_id IS NOT NULL")
+    cursor.execute("INSERT OR IGNORE INTO users(user_id,username,first_name,last_name,created_at,last_active) SELECT DISTINCT user_id, 'None', '', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM posts WHERE user_id IS NOT NULL")
+    cursor.execute("INSERT OR IGNORE INTO users(user_id,username,first_name,last_name,created_at,last_active) SELECT DISTINCT user_id, 'None', '', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM tickets WHERE user_id IS NOT NULL")
+    conn.commit()
+
 async def export_excel(admin_id: int):
-    if not is_real_admin(admin_id):
-        return
-    filename = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    cursor.execute('''SELECT user_id, username, first_name, last_name,
-                      language_code, is_premium, avatar_file_id,
-                      created_at, last_active FROM users ORDER BY user_id''')
-    rows = cursor.fetchall()
-    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f, delimiter=";")
-        writer.writerow(["ID", "Username", "Имя", "Фамилия", "Язык",
-                         "Premium", "Avatar file_id", "Регистрация", "Активность"])
-        writer.writerows(rows)
-    try:
-        await bot.send_document(
-            admin_id, FSInputFile(filename),
-            caption=f"📊 Пользователей выгружено: {len(rows)}"
-        )
+    if not is_real_admin(admin_id): return
+    sync_users_from_legacy_tables()
+    filename=f"database_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    wb=Workbook()
+    tables=[
+        ("Пользователи","SELECT user_id,username,first_name,last_name,language_code,is_premium,avatar_file_id,created_at,last_active FROM users ORDER BY user_id"),
+        ("Посты","SELECT * FROM posts ORDER BY id"),("Тикеты","SELECT * FROM tickets ORDER BY id"),
+        ("История тикетов","SELECT * FROM ticket_messages ORDER BY id"),("Медиа","SELECT * FROM post_media ORDER BY id"),
+        ("Баны","SELECT * FROM banned_users ORDER BY user_id"),("Расписание","SELECT * FROM scheduled_posts ORDER BY id")]
+    for i,(title,q) in enumerate(tables):
+        sh=wb.active if i==0 else wb.create_sheet()
+        sh.title=title; cursor.execute(q); rows=cursor.fetchall(); sh.append([d[0] for d in cursor.description])
+        for r in rows: sh.append(list(r))
+        sh.freeze_panes='A2'; sh.auto_filter.ref=sh.dimensions
+        for col in sh.columns:
+            sh.column_dimensions[col[0].column_letter].width=min(max(len(str(c.value or '')) for c in col)+2,45)
+    wb.save(filename)
+    try: await bot.send_document(admin_id,FSInputFile(filename),caption='📊 Полный Excel-экспорт базы')
     finally:
-        if os.path.exists(filename):
-            os.remove(filename)
+        if os.path.exists(filename): os.remove(filename)
 
-
-async def export_db(admin_id: int):
-    if not is_real_admin(admin_id):
-        return
-    backup_name = f"suggestions_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-    backup_conn = None
+def create_sqlite_backup():
+    backup_dir=FilePath(os.path.dirname(DB_PATH))/"backups"; backup_dir.mkdir(parents=True,exist_ok=True)
+    path=backup_dir/f"suggestions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    dst=sqlite3.connect(str(path))
     try:
-        # SQLite backup безопаснее, чем отправка файла БД прямо во время записи.
-        backup_conn = sqlite3.connect(backup_name)
-        with backup_conn:
-            conn.backup(backup_conn)
-        await bot.send_document(
-            admin_id, FSInputFile(backup_name),
-            caption="💾 Полная резервная копия SQLite-базы"
-        )
+        conn.backup(dst)
+    finally: dst.close()
+    backups=sorted(backup_dir.glob('suggestions_*.db'),key=lambda x:x.stat().st_mtime,reverse=True)
+    for old in backups[14:]:
+        try: old.unlink()
+        except OSError: pass
+    return str(path)
+
+async def export_db(admin_id:int):
+    if not is_real_admin(admin_id): return
+    path=create_sqlite_backup()
+    await bot.send_document(admin_id,FSInputFile(path),caption='💾 Согласованная резервная копия SQLite-базы')
+
+async def automatic_backup_loop():
+    interval=max(1,int(os.getenv('BACKUP_INTERVAL_HOURS','24')))*3600
+    while True:
+        try:
+            await asyncio.sleep(interval); create_sqlite_backup()
+            logging.info('Automatic SQLite backup created')
+        except asyncio.CancelledError: raise
+        except Exception: logging.exception('Automatic backup failed')
+
+def safe_filename(value):
+    return ''.join(c if c.isalnum() or c in '-_' else '_' for c in str(value))[:80] or 'file'
+
+async def build_ticket_zip(ticket_id:int):
+    work=FilePath(os.path.dirname(DB_PATH))/"ticket_exports"/f"ticket_{ticket_id}_{int(time.time())}"; media_dir=work/'media'; media_dir.mkdir(parents=True,exist_ok=True)
+    cursor.execute("SELECT sender_type,sender_id,sender_name,text,media_type,file_id,created_at FROM ticket_messages WHERE ticket_id=? ORDER BY id",(ticket_id,)); msgs=cursor.fetchall(); media_map={}
+    for i,row in enumerate(msgs,1):
+        mtype,file_id=row[4],row[5]
+        if not file_id or mtype in (None,'text','album'): continue
+        try:
+            tgfile=await bot.get_file(file_id); ext={'photo':'.jpg','video':'.mp4','audio':'.mp3','document':'.bin'}.get(mtype,'.bin'); target=media_dir/f'{i:04d}_{safe_filename(mtype)}{ext}'
+            await bot.download_file(tgfile.file_path,destination=str(target)); media_map[file_id]=f'media/{target.name}'
+        except Exception: logging.exception('Media export failed for ticket %s',ticket_id)
+    (work/'history.html').write_text(build_ticket_html(ticket_id,media_map),encoding='utf-8')
+    (work/'README.txt').write_text(f'Ticket #{ticket_id}\nOpen history.html in a browser.\n',encoding='utf-8')
+    zip_path=FilePath(os.path.dirname(DB_PATH))/f'ticket_{ticket_id}_full.zip'
+    with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED) as z: 
+        for f in work.rglob('*'):
+            if f.is_file(): z.write(f,f.relative_to(work))
+    shutil.rmtree(work,ignore_errors=True); return str(zip_path)
+
+def build_ticket_html(ticket_id:int, media_map=None)->str:
+    media_map=media_map or {}
+    cursor.execute("SELECT t.id,t.user_id,t.status,t.created_at,u.username,u.first_name,u.last_name,t.post_id,p.status,p.text,p.media_type,p.created_at FROM tickets t LEFT JOIN users u ON u.user_id=t.user_id LEFT JOIN posts p ON p.id=t.post_id WHERE t.id=?",(ticket_id,)); t=cursor.fetchone()
+    if not t: raise ValueError('Тикет не найден')
+    tid,uid,status,created,username,first_name,last_name,pid,pstatus,ptext,pmtype,pcreated=t
+    cursor.execute("SELECT sender_type,sender_id,sender_name,text,media_type,file_id,created_at FROM ticket_messages WHERE ticket_id=? ORDER BY id",(ticket_id,)); msgs=cursor.fetchall()
+    esc=lambda v:html.escape(str(v or '')); name=(f'@{username}' if username and username!='None' else (first_name or 'Пользователь'))+(f' {last_name}' if last_name else '')
+    blocks=[]
+    for i,(stype,sid,sname,text,mtype,file_id,ctime) in enumerate(msgs,1):
+        role='Пользователь' if stype=='user' else 'Администратор'; cls='user' if stype=='user' else 'admin'; media=''
+        if mtype and mtype!='text':
+            rel=media_map.get(file_id)
+            if rel and mtype=='photo': media=f"<div class='media'><img src='{esc(rel)}'><br><a href='{esc(rel)}'>Открыть фото</a></div>"
+            elif rel and mtype=='video': media=f"<div class='media'><video controls src='{esc(rel)}'></video><br><a href='{esc(rel)}'>Скачать видео</a></div>"
+            elif rel: media=f"<div class='media'><a href='{esc(rel)}'>📎 Скачать {esc(mtype)}</a></div>"
+            else: media=f"<div class='media'>📎 {esc(mtype)} <small>{esc(file_id)}</small></div>"
+        blocks.append(f"<div class='message {cls}'><div class='meta'><b>{esc(role)}</b> · {esc(sname)} · {esc(ctime)}</div><div>{esc(text).replace(chr(10),'<br>')}</div>{media}</div>")
+    return f"<!doctype html><html lang='ru'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Тикет #{tid}</title><style>body{{font-family:Arial;background:#f4f5f7;padding:24px}}.container{{max-width:950px;margin:auto}}.card,.message{{background:#fff;border-radius:14px;padding:18px;margin:12px 0;box-shadow:0 2px 8px #0001}}.user{{background:#eef6ff}}.admin{{background:#f6fef9}}.meta{{color:#667085;font-size:13px;margin-bottom:8px}}img,video{{max-width:100%;border-radius:10px}}</style><div class='container'><div class='card'><h1>💬 Тикет #{tid}</h1><p><b>Пользователь:</b> {esc(name)}<br><b>ID:</b> {uid}<br><b>Статус:</b> {esc(status)}<br><b>Пост:</b> #{pid} ({esc(pstatus)})<br><b>Создан:</b> {esc(created)}</p></div><div class='card'><h2>📝 Исходная заявка</h2>{esc(ptext).replace(chr(10),'<br>')}<br><small>{esc(pmtype)} · {esc(pcreated)}</small></div><div class='card'><h2>📜 История чата ({len(msgs)})</h2>{''.join(blocks) or '<i>Сообщений нет.</i>'}</div></div></html>"
+
+@dp.callback_query(F.data.startswith('ticket_html_'))
+async def ticket_html_callback(callback:types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    filename=None
+    try:
+        tid=int(callback.data.split('_')[-1]); filename=f'ticket_{tid}_history.html'; open(filename,'w',encoding='utf-8').write(build_ticket_html(tid)); await bot.send_document(callback.from_user.id,FSInputFile(filename),caption=f'📄 Полная HTML-история тикета #{tid}'); await callback.answer('📄 HTML отправлен')
+    except Exception: logging.exception('HTML export error'); await callback.answer('❌ Не удалось сформировать HTML.',show_alert=True)
     finally:
-        if backup_conn:
-            backup_conn.close()
-        if os.path.exists(backup_name):
-            os.remove(backup_name)
+        if filename and os.path.exists(filename): os.remove(filename)
+
+@dp.callback_query(F.data.startswith('ticket_zip_'))
+async def ticket_zip_callback(callback:types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    filename=None
+    try:
+        tid=int(callback.data.split('_')[-1]); filename=await build_ticket_zip(tid); await bot.send_document(callback.from_user.id,FSInputFile(filename),caption=f'📦 Полный архив тикета #{tid}: HTML + медиа'); await callback.answer('📦 Архив готов')
+    except Exception: logging.exception('ZIP export error'); await callback.answer('❌ Не удалось собрать архив.',show_alert=True)
+    finally:
+        if filename and os.path.exists(filename): os.remove(filename)
+
+async def show_user_profile(user_id:int,admin_id:int,callback=None,message=None):
+    if not is_real_admin(admin_id): return await (callback.answer('🔒 Доступ запрещен.',show_alert=True) if callback else None)
+    sync_users_from_legacy_tables(); cursor.execute("SELECT user_id,username,first_name,last_name,language_code,is_premium,avatar_file_id,created_at,last_active FROM users WHERE user_id=?",(user_id,)); u=cursor.fetchone()
+    if not u: return await (callback.answer('Пользователь не найден.',show_alert=True) if callback else message.answer('Пользователь не найден.'))
+    uid,un,fn,ln,lang,prem,av,created,last=u; name=' '.join(x for x in [fn,ln] if x) or 'Без имени'
+    def cnt(q): cursor.execute(q,(uid,)); return cursor.fetchone()[0]
+    pc=cnt('SELECT COUNT(*) FROM posts WHERE user_id=?'); pub=cnt("SELECT COUNT(*) FROM posts WHERE user_id=? AND status='published'"); rej=cnt("SELECT COUNT(*) FROM posts WHERE user_id=? AND status='rejected'"); tc=cnt('SELECT COUNT(*) FROM tickets WHERE user_id=?'); oc=cnt("SELECT COUNT(*) FROM tickets WHERE user_id=? AND status='open'")
+    text=(f"👤 <b>ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ</b>\n\n<b>{html.escape(name)}</b>\nUsername: {('@'+html.escape(un)) if un and un!='None' else 'нет'}\n🆔 ID: <code>{uid}</code>\n🌐 Язык: {html.escape(lang or '—')}\n⭐ Premium: {'да' if prem else 'нет'}\n🚫 Бан: {'да' if is_banned(uid) else 'нет'}\n\n📊 <b>Статистика</b>\n• Постов: {pc}\n• Опубликовано: {pub}\n• Отклонено: {rej}\n• Тикетов: {tc}\n• Открытых: {oc}\n\n📅 Регистрация: {html.escape(str(created or '—'))}\n🕐 Активность: {html.escape(str(last or '—'))}")
+    kb=InlineKeyboardBuilder(); kb.button(text='📋 Посты пользователя',callback_data=f'user_posts_{uid}_0'); kb.button(text='💬 Тикеты пользователя',callback_data=f'user_tickets_{uid}_0'); kb.button(text='🚫 Забанить' if not is_banned(uid) else '✅ Разбанить',callback_data=f'profile_ban_{uid}'); kb.button(text='🔙 Назад',callback_data='back_to_admin'); kb.adjust(1)
+    if callback: await callback.message.edit_text(text,reply_markup=kb.as_markup()); await callback.answer()
+    else: await message.answer(text,reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith('user_profile_'))
+async def user_profile_callback(callback:types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    await show_user_profile(int(callback.data.split('_')[-1]),callback.from_user.id,callback=callback)
+
+@dp.message(Command('user'))
+async def user_command(message:types.Message):
+    if not is_real_admin(message.from_user.id): return
+    parts=message.text.split(maxsplit=1)
+    if len(parts)<2 or not parts[1].strip().isdigit(): return await message.answer('Использование: <code>/user 123456789</code>')
+    await show_user_profile(int(parts[1].strip()),message.from_user.id,message=message)
+
+@dp.message(Command('finduser'))
+async def find_user_command(message:types.Message):
+    if not is_real_admin(message.from_user.id): return
+    parts=message.text.split(maxsplit=1); q=parts[1].strip().lstrip('@') if len(parts)>1 else ''
+    if not q: return await message.answer('Использование: <code>/finduser username</code> или имя')
+    cursor.execute("SELECT user_id,username,first_name,last_name FROM users WHERE username LIKE ? OR first_name LIKE ? OR last_name LIKE ? ORDER BY last_active DESC LIMIT 20",(f'%{q}%',f'%{q}%',f'%{q}%')); rows=cursor.fetchall(); kb=InlineKeyboardBuilder()
+    for uid,un,fn,ln in rows: kb.button(text=f"👤 {('@'+un) if un and un!='None' else (' '.join(x for x in [fn,ln] if x) or str(uid))} [{uid}]",callback_data=f'user_profile_{uid}')
+    kb.button(text='🔙 Админка',callback_data='back_to_admin'); kb.adjust(1); await message.answer(f'🔎 Найдено: {len(rows)}',reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith('profile_ban_'))
+async def profile_ban_callback(callback:types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    uid=int(callback.data.split('_')[-1]); cursor.execute('SELECT username FROM users WHERE user_id=?',(uid,)); row=cursor.fetchone();
+    if is_banned(uid):
+        cursor.execute('DELETE FROM banned_users WHERE user_id=?',(uid,)); conn.commit(); await callback.answer('✅ Пользователь разбанен')
+    else:
+        username=row[0] if row else 'None'; cursor.execute('INSERT OR REPLACE INTO banned_users(user_id,username) VALUES(?,?)',(uid,username)); conn.commit(); await callback.answer('🚫 Пользователь заблокирован')
+    await show_user_profile(uid,callback.from_user.id,callback=callback)
+
+@dp.message(Command('findticket'))
+async def find_ticket_command(message:types.Message):
+    if not is_real_admin(message.from_user.id): return
+    parts=message.text.split(maxsplit=1); q=parts[1].strip() if len(parts)>1 else ''
+    if not q: return await message.answer('Использование: <code>/findticket 123</code> или <code>/findticket username</code>')
+    if q.isdigit():
+        cursor.execute('SELECT id FROM tickets WHERE id=?',(int(q),)); ids=[r[0] for r in cursor.fetchall()]
+    else:
+        q=q.lstrip('@'); cursor.execute("SELECT t.id FROM tickets t LEFT JOIN users u ON u.user_id=t.user_id WHERE u.username LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ? ORDER BY t.id DESC LIMIT 30",(f'%{q}%',f'%{q}%',f'%{q}%')); ids=[r[0] for r in cursor.fetchall()]
+    kb=InlineKeyboardBuilder()
+    for tid in ids: kb.button(text=f'💬 Тикет #{tid}',callback_data=f'open_ticket_{tid}')
+    kb.button(text='🔙 Админка',callback_data='back_to_admin'); kb.adjust(1)
+    await message.answer(f'🔎 Найдено тикетов: {len(ids)}',reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith('user_posts_'))
+async def user_posts_callback(callback:types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    parts=callback.data.split('_'); uid=int(parts[2]); page=int(parts[3]); limit=10; offset=page*limit
+    cursor.execute("SELECT id,status,media_type,text,created_at FROM posts WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?",(uid,limit,offset)); rows=cursor.fetchall(); kb=InlineKeyboardBuilder(); text=f'📋 <b>Посты пользователя {uid}</b>\n\n'
+    for pid,st,mt,tx,dt in rows: text+=f'#{pid} · {st} · {mt} · {html.escape((tx or "")[:60])} · {dt}\n'
+    if page: kb.button(text='⬅️',callback_data=f'user_posts_{uid}_{page-1}')
+    if len(rows)==limit: kb.button(text='➡️',callback_data=f'user_posts_{uid}_{page+1}')
+    kb.button(text='👤 Профиль',callback_data=f'user_profile_{uid}'); kb.adjust(2,1)
+    await callback.message.edit_text(text if rows else '📋 Постов нет.',reply_markup=kb.as_markup()); await callback.answer()
+
+@dp.callback_query(F.data.startswith('user_tickets_'))
+async def user_tickets_callback(callback:types.CallbackQuery):
+    if not is_real_admin(callback.from_user.id): return await callback.answer('🔒 Доступ запрещен.',show_alert=True)
+    parts=callback.data.split('_'); uid=int(parts[2]); page=int(parts[3]); limit=8; offset=page*limit
+    cursor.execute("SELECT id,status,created_at FROM tickets WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?",(uid,limit,offset)); rows=cursor.fetchall(); kb=InlineKeyboardBuilder(); text=f'💬 <b>Тикеты пользователя {uid}</b>\n\n'
+    for tid,st,dt in rows: text+=f'#{tid} · {st} · {dt}\n'; kb.button(text=f'💬 Тикет #{tid}',callback_data=f'open_ticket_{tid}')
+    if page: kb.button(text='⬅️',callback_data=f'user_tickets_{uid}_{page-1}')
+    if len(rows)==limit: kb.button(text='➡️',callback_data=f'user_tickets_{uid}_{page+1}')
+    kb.button(text='👤 Профиль',callback_data=f'user_profile_{uid}'); kb.adjust(1)
+    await callback.message.edit_text(text if rows else '💬 Тикетов нет.',reply_markup=kb.as_markup()); await callback.answer()
 
 def save_admin_msg_mapping(admin_id: int, admin_msg_id: int, user_id: int):
     cursor.execute("INSERT OR REPLACE INTO admin_messages (admin_id, admin_msg_id, user_id) VALUES (?, ?, ?)",
@@ -1378,6 +1538,9 @@ async def open_ticket_callback_by_id(callback: types.CallbackQuery, ticket_id: i
         builder.button(text="💬 Войти в режим чата", callback_data=f"enter_chat_{tid}")
         builder.button(text="🏁 Завершить ТИКЕТ", callback_data=f"close_ticket_{tid}")
 
+    builder.button(text="👤 Профиль пользователя", callback_data=f"user_profile_{uid}")
+    builder.button(text="📄 Открыть полную историю HTML", callback_data=f"ticket_html_{tid}")
+    builder.button(text="📦 Скачать тикет ZIP", callback_data=f"ticket_zip_{tid}")
     builder.button(text="🔙 К списку тикетов", callback_data="list_tickets")
     builder.button(text="🔙 Назад в админку", callback_data="back_to_admin")
     builder.adjust(1)
@@ -2231,6 +2394,7 @@ async def main():
     await site.start()
 
     asyncio.create_task(scheduled_publisher_loop())
+    asyncio.create_task(automatic_backup_loop())
 
     logging.info(f"Bot polling started on port {PORT}...")
     await dp.start_polling(bot)
